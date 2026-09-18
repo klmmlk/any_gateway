@@ -1,6 +1,7 @@
 loguru
 pydantic
 fastapi
+python-multipart
 aiofiles
 aiosqlite
 httpx
