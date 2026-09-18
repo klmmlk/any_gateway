@@ -655,6 +655,80 @@ async def redeem_voucher_anonymously(
     }
 
 
+public_key_router = APIRouter(tags=["Key: Public"])
+
+
+@public_key_router.get("/key/status", summary="查询 API key 当前状态（外部应用自查）")
+async def query_key_status(
+    authorization: str = Header(default=""),
+    x_api_key: str = Header(default="", alias="X-API-Key"),
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """用 API key 本身查询其状态，无需登录。
+
+    路径在 /v1/ 之外，不经过网关鉴权中间件与限流检查：
+    冻结/过期的 key 也能拿到结构化状态（否则会被中间件直接 401 拦截），
+    且查询本身不占用分组的限流窗口。
+    """
+    key = x_api_key or authorization.removeprefix("Bearer ").strip()
+    if not key:
+        raise HTTPException(status_code=401, detail="missing api key")
+
+    result = await session.execute(select(Token).where(Token.key == key))
+    token = result.scalar_one_or_none()
+    if token is None:
+        return {"valid": False, "status": "invalid"}
+
+    now = datetime.now(timezone.utc)
+    frozen = bool(token.frozen)
+    expired = False
+    expires_dt = None
+    if token.expires_at:
+        try:
+            expires_dt = datetime.fromisoformat(
+                token.expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            logger.error(f"key 状态查询遇到异常 expires_at: {token.expires_at!r}")
+            return {"valid": False, "status": "invalid", "name": token.name}
+        expired = now > expires_dt
+
+    status = "frozen" if frozen else "expired" if expired else "active"
+
+    unlimited = (token.quota_usd or 0) <= 0
+    remaining = (
+        None if unlimited
+        else round(max(token.quota_usd - (token.used_usd or 0), 0), 6)
+    )
+
+    group_name = None
+    if token.group_id:
+        group_result = await session.execute(
+            select(UserGroup).where(UserGroup.id == token.group_id)
+        )
+        group = group_result.scalar_one_or_none()
+        group_name = group.name if group else token.group_id
+
+    expires_in = None
+    if expires_dt is not None and not expired:
+        expires_in = int((expires_dt - now).total_seconds())
+
+    return {
+        "valid": status == "active",
+        "status": status,
+        "name": token.name,
+        "group": group_name,
+        "quota_usd": token.quota_usd,
+        "used_usd": token.used_usd or 0,
+        "remaining_usd": remaining,
+        "unlimited": unlimited,
+        "frozen": frozen,
+        "expires_at": token.expires_at,
+        "expires_in_seconds": expires_in,
+        "created_at": token.created_at,
+    }
+
+
 @public_voucher_router.get("/voucher", summary="兑卡页面（公开，无需登录）")
 async def voucher_redeem_page():
     from fastapi.responses import HTMLResponse
