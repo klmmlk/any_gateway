@@ -35,6 +35,9 @@ const Vouchers: React.FC = () => {
         amount_usd: values.amount_usd,
         count: values.count ?? 1,
       }
+      if (values.duration_days) {
+        payload.duration_days = values.duration_days
+      }
       if (values.expires_at) {
         payload.expires_at = values.expires_at
       }
@@ -86,6 +89,13 @@ const Vouchers: React.FC = () => {
       render: (v: string) => v
         ? <span style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--ag-outline)' }}>{v.slice(0, 10)}</span>
         : <Tag color="gray">永不过期</Tag>,
+    },
+    {
+      title: 'Key 有效期',
+      dataIndex: 'duration_days',
+      render: (v: number | null) => v
+        ? <Tag color="arcoblue">{v} 天</Tag>
+        : <span style={{ color: 'var(--ag-outline)' }}>充值型</span>,
     },
     {
       title: '状态',
@@ -153,6 +163,9 @@ const Vouchers: React.FC = () => {
           </Form.Item>
           <Form.Item field="count" label="数量" initialValue={1} rules={[{ required: true }]}>
             <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item field="duration_days" label="Key 有效天数（选填）" extra="填写后此券为兑卡型：在 /voucher 页匿名兑换直接发放 API key；不填则为充值型，登录后兑换进余额">
+            <InputNumber min={1} max={3650} precision={0} style={{ width: '100%' }} placeholder="如 7 / 30 / 365" />
           </Form.Item>
           <Form.Item field="expires_at" label="过期时间（选填）">
             <DatePicker style={{ width: '100%' }} />

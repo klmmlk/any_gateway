@@ -156,6 +156,8 @@ class UsageLog(SQLModel, table=True):
 class VoucherBase(SQLModel):
     amount_usd: float
     expires_at: str | None = None
+    # 兑换后生成 API key 的有效天数；None = 兑换走旧逻辑（登录充值余额）
+    duration_days: int | None = None
 
 
 class Voucher(VoucherBase, table=True):

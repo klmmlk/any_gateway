@@ -557,6 +557,185 @@ async def redeem_voucher(
     }
 
 
+# ---------------------------------------------------------------------------
+# 匿名兑卡（公开接口，无需登录）：兑换直接发放限时 API key
+# ---------------------------------------------------------------------------
+
+public_voucher_router = APIRouter(tags=["Voucher: Public"])
+
+
+class PublicRedeemRequest(BaseModel):
+    code: str
+
+
+@public_voucher_router.post("/voucher/redeem", summary="匿名兑换消费券，直接发放 API key")
+async def redeem_voucher_anonymously(
+    body: PublicRedeemRequest,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """兑换消费券为 API key，无需任何账号。
+
+    - key 额度 = 券面值（quota_usd，用尽即 402）
+    - key 有效期 = duration_days 天（未设置则不限时，仅受额度约束）
+    - 券码一次性，兑换成功立即作废
+    """
+    from datetime import datetime, timedelta, timezone
+
+    code = body.code.strip()
+    result = await session.execute(
+        select(Voucher).where(Voucher.code == code, Voucher.used == False)
+    )
+    voucher = result.scalar_one_or_none()
+    if voucher is None:
+        raise HTTPException(status_code=404, detail="券码不存在或已被使用")
+
+    now = datetime.now(timezone.utc)
+    if voucher.expires_at:
+        try:
+            expires = datetime.fromisoformat(
+                voucher.expires_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise HTTPException(status_code=500, detail="消费券过期时间格式异常")
+        if now > expires:
+            raise HTTPException(status_code=410, detail="消费券已过期")
+
+    now_str = now.isoformat().replace("+00:00", "Z")
+    if voucher.duration_days:
+        key_expires_at = (
+            (now + timedelta(days=voucher.duration_days))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+    else:
+        key_expires_at = None
+
+    # 绑定 default 分组：无分组且无用户名的 token 会被余额检查直接拒绝（429），
+    # 绑定后走分组限流与分组内路由，行为与普通 key 一致
+    group_result = await session.execute(
+        select(UserGroup).where(UserGroup.name == "default")
+    )
+    default_group = group_result.scalar_one_or_none()
+
+    token = Token(
+        name=f"voucher-{code[:8]}",
+        quota_usd=voucher.amount_usd,
+        expires_at=key_expires_at,
+        group_id=default_group.id if default_group else None,
+    )
+    session.add(token)
+
+    voucher.used = True
+    voucher.used_at = now_str
+    voucher.used_by = f"anonymous:{token.id[:8]}"
+    session.add(voucher)
+    await session.commit()
+
+    logger.info(
+        f"匿名兑卡 code={code[:4]}*** -> token={token.id[:8]} "
+        f"quota=${voucher.amount_usd} duration_days={voucher.duration_days}"
+    )
+    return {
+        "key": token.key,
+        "name": token.name,
+        "quota_usd": voucher.amount_usd,
+        "duration_days": voucher.duration_days,
+        "expires_at": key_expires_at,
+    }
+
+
+@public_voucher_router.get("/voucher", summary="兑卡页面（公开，无需登录）")
+async def voucher_redeem_page():
+    from fastapi.responses import HTMLResponse
+
+    return HTMLResponse("""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>兑换 API Key</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+         background: #0f1117; color: #e8eaf0; display: flex; min-height: 100vh;
+         align-items: center; justify-content: center; margin: 0; }
+  .card { background: #171a23; border: 1px solid #262b38; border-radius: 14px;
+          padding: 36px 32px; width: min(440px, 92vw); box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  p.sub { color: #8b93a7; font-size: 13px; margin: 0 0 24px; line-height: 1.6; }
+  input { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 8px;
+          border: 1px solid #2c3242; background: #0f1117; color: #e8eaf0;
+          font-size: 15px; font-family: ui-monospace, SFMono-Regular, monospace; }
+  input:focus { outline: none; border-color: #4c7dff; }
+  button { width: 100%; margin-top: 14px; padding: 12px; border: none; border-radius: 8px;
+           background: #4c7dff; color: #fff; font-size: 15px; cursor: pointer; }
+  button:hover { background: #3d6ce8; }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { color: #ff6b6b; font-size: 13px; margin-top: 12px; min-height: 16px; }
+  .result { display: none; margin-top: 22px; border-top: 1px solid #262b38; padding-top: 22px; }
+  .result.show { display: block; }
+  .label { color: #8b93a7; font-size: 12px; margin-bottom: 6px; }
+  .key { background: #0f1117; border: 1px dashed #3a4258; border-radius: 8px; padding: 12px 14px;
+         font-family: ui-monospace, monospace; font-size: 14px; word-break: break-all;
+         color: #7ee2a8; cursor: pointer; }
+  .key:hover { border-color: #4c7dff; }
+  .meta { color: #8b93a7; font-size: 13px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>兑换 API Key</h1>
+  <p class="sub">输入消费券券码，立即获得一张对应额度与有效期的 API Key。<br>
+     Key 可用于调用本网关的 OpenAI 兼容接口。</p>
+  <input id="code" placeholder="请输入券码" autocomplete="off" spellcheck="false">
+  <button id="btn" onclick="redeem()">兑 换</button>
+  <div class="err" id="err"></div>
+  <div class="result" id="result">
+    <div class="label">你的 API Key（点击复制，请妥善保管）</div>
+    <div class="key" id="key" onclick="copyKey()" title="点击复制"></div>
+    <div class="meta" id="meta"></div>
+  </div>
+</div>
+<script>
+async function redeem() {
+  const code = document.getElementById('code').value.trim();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('err');
+  const res = document.getElementById('result');
+  err.textContent = ''; res.classList.remove('show');
+  if (!code) { err.textContent = '请输入券码'; return; }
+  btn.disabled = true; btn.textContent = '兑换中…';
+  try {
+    const r = await fetch('/voucher/redeem', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    });
+    const data = await r.json();
+    if (!r.ok) { err.textContent = data.detail || '兑换失败'; return; }
+    document.getElementById('key').textContent = data.key;
+    document.getElementById('meta').textContent =
+      '额度 $' + data.quota_usd +
+      (data.expires_at ? ' · 有效期至 ' + data.expires_at.slice(0, 10) : ' · 无时间限制');
+    res.classList.add('show');
+  } catch (e) {
+    err.textContent = '网络错误，请重试';
+  } finally {
+    btn.disabled = false; btn.textContent = '兑 换';
+  }
+}
+function copyKey() {
+  navigator.clipboard.writeText(document.getElementById('key').textContent)
+    .then(() => { const b = document.getElementById('btn'); const t = b.textContent;
+                  b.textContent = '已复制 ✓'; setTimeout(() => b.textContent = t, 1200); });
+}
+document.getElementById('code').addEventListener('keydown', e => {
+  if (e.key === 'Enter') redeem();
+});
+</script>
+</body>
+</html>""")
+
+
 @user_router.get("/groups", summary="列出当前用户可见分组（供 Token 绑定选择）")
 async def list_groups_for_user(
     session: AsyncSession = Depends(async_session_generator),

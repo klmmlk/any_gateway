@@ -69,6 +69,15 @@ async def init_db():
         except Exception:
             pass
 
+    # vouchers 表的兑卡时长（匿名兑卡直接吐 key 的有效天数，幂等自动加列）
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "ALTER TABLE vouchers ADD COLUMN duration_days INTEGER"
+            ))
+        except Exception:
+            pass
+
     # 确保 default 分组存在（幂等）
     from db.models import UserGroup
     async with AsyncSession(engine, expire_on_commit=False) as session:
