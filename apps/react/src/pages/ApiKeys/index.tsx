@@ -142,6 +142,21 @@ const ApiKeys: React.FC = () => {
       )
     },
     {
+      title: '过期时间',
+      dataIndex: 'expires_at',
+      render: (v: string) => {
+        if (!v) return <Tag color="gray">永久</Tag>
+        const expired = new Date(v) < new Date()
+        if (expired) return <Tag color="red">已过期</Tag>
+        const days = Math.ceil((new Date(v).getTime() - Date.now()) / 86400000)
+        return (
+          <span title={v} style={{ color: 'var(--ag-outline)', fontSize: 11, fontFamily: 'monospace' }}>
+            {v.slice(0, 10)}（剩 {days} 天）
+          </span>
+        )
+      }
+    },
+    {
       title: '创建时间',
       dataIndex: 'created_at',
       render: (v: string) => <span style={{ color: 'var(--ag-outline)', fontSize: 11, fontFamily: 'monospace' }}>{v?.slice(0, 10)}</span>

@@ -387,12 +387,23 @@ async def list_my_tokens(
     session: AsyncSession = Depends(async_session_generator),
     current_user: dict = Depends(require_auth),
 ) -> dict:
-    """仅返回当前登录用户自己创建的 Token。"""
-    stmt = (
-        select(Token)
-        .where(Token.username == current_user["username"])
-        .order_by(Token.created_at.desc())
-    )
+    """仅返回当前登录用户自己创建的 Token。
+
+    管理员额外可见无主 Token（username 为空，如匿名兑卡发放的 key），
+    便于在界面上追踪、冻结或删除兑出的卡。
+    """
+    from sqlalchemy import or_
+
+    stmt = select(Token).order_by(Token.created_at.desc())
+    if current_user.get("role") in ("admin", "superadmin"):
+        stmt = stmt.where(
+            or_(
+                Token.username == current_user["username"],
+                Token.username.is_(None),
+            )
+        )
+    else:
+        stmt = stmt.where(Token.username == current_user["username"])
     result = await session.execute(stmt)
     tokens = list(result.scalars().all())
     return {"data": [t.model_dump() for t in tokens], "total": len(tokens)}
