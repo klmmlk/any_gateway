@@ -12,6 +12,8 @@ const Vouchers: React.FC = () => {
   const [visible, setVisible] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [form] = Form.useForm()
+  const [resultCodes, setResultCodes] = useState<string[]>([])
+  const [resultVisible, setResultVisible] = useState(false)
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -43,12 +45,15 @@ const Vouchers: React.FC = () => {
       }
       const res = await createVoucher(payload)
       const data = res.data
-      if (data?.vouchers) {
-        // 批量创建
-        Message.success(`已生成 ${data.count} 张消费券`)
+      const codes: string[] = data?.vouchers
+        ? data.vouchers.map((v: any) => v.code).filter(Boolean)
+        : [data?.code ?? data?.data?.code].filter(Boolean)
+      if (codes.length > 0) {
+        setResultCodes(codes)
+        setResultVisible(true)
+        Message.success(`已生成 ${codes.length} 张消费券`)
       } else {
-        const code = data?.code ?? data?.data?.code ?? '（查看列表）'
-        Message.success(`创建成功！券码：${code}`)
+        Message.success('创建成功（券码见列表）')
       }
       setVisible(false)
       form.resetFields()
@@ -70,6 +75,18 @@ const Vouchers: React.FC = () => {
     }
   }
 
+  const downloadTxt = () => {
+    const blob = new Blob([resultCodes.join('\n')], { type: 'text/plain;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `vouchers-${new Date().toISOString().slice(0, 10)}.txt`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
   const columns = [
     {
       title: '券码',
@@ -81,7 +98,9 @@ const Vouchers: React.FC = () => {
     {
       title: '金额 (USD)',
       dataIndex: 'amount_usd',
-      render: (v: number) => <strong style={{ fontFamily: 'monospace' }}>${v.toFixed(2)}</strong>,
+      render: (v: number) => v === 0
+        ? <strong style={{ fontFamily: 'monospace' }}>∞</strong>
+        : <strong style={{ fontFamily: 'monospace' }}>${v.toFixed(2)}</strong>,
     },
     {
       title: '过期时间',
@@ -158,8 +177,8 @@ const Vouchers: React.FC = () => {
         unmountOnExit
       >
         <Form form={form} onSubmit={handleSubmit} layout="vertical">
-          <Form.Item field="amount_usd" label="金额 (USD)" rules={[{ required: true }]}>
-            <InputNumber min={0.01} step={1} precision={2} style={{ width: '100%' }} />
+          <Form.Item field="amount_usd" label="金额 (USD)" extra="0 = 无限额度（配合 Key 有效天数使用，兑出的 key 不限量）" rules={[{ required: true }]}>
+            <InputNumber min={0} step={1} precision={2} style={{ width: '100%' }} placeholder="0 为无限额度" />
           </Form.Item>
           <Form.Item field="count" label="数量" initialValue={1} rules={[{ required: true }]}>
             <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
@@ -171,6 +190,37 @@ const Vouchers: React.FC = () => {
             <DatePicker style={{ width: '100%' }} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title={`已生成 ${resultCodes.length} 张消费券`}
+        visible={resultVisible}
+        onCancel={() => setResultVisible(false)}
+        footer={
+          <>
+            <Button onClick={() => setResultVisible(false)}>关闭</Button>
+            <Button type="primary" onClick={downloadTxt}>下载 TXT</Button>
+          </>
+        }
+        unmountOnExit
+      >
+        <p style={{ color: 'var(--ag-outline)', fontSize: 12, margin: '0 0 8px' }}>
+          每行一个券码，请妥善保管。兑换入口：/voucher（兑卡型）或登录后 Dashboard 兑换（充值型）
+        </p>
+        <pre style={{
+          background: 'rgba(127,127,127,.08)',
+          border: '1px solid rgba(127,127,127,.25)',
+          borderRadius: 8,
+          padding: 12,
+          fontSize: 13,
+          fontFamily: 'ui-monospace, monospace',
+          whiteSpace: 'pre',
+          margin: 0,
+          maxHeight: 240,
+          overflow: 'auto',
+        }}>
+          {resultCodes.join('\n')}
+        </pre>
       </Modal>
     </div>
   )

@@ -724,8 +724,9 @@ async function redeem() {
     const data = await r.json();
     if (!r.ok) { err.textContent = data.detail || '兑换失败'; return; }
     document.getElementById('key').textContent = data.key;
+    const quota = data.quota_usd === 0 ? '无限额度' : '额度 $' + data.quota_usd;
     document.getElementById('meta').textContent =
-      '额度 $' + data.quota_usd +
+      quota +
       (data.expires_at ? ' · 有效期至 ' + data.expires_at.slice(0, 10) : ' · 无时间限制');
     res.classList.add('show');
   } catch (e) {
