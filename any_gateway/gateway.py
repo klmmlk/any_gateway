@@ -597,6 +597,27 @@ def _httpx_client_kwargs(
     return kwargs
 
 
+def _body_for_log(body: Optional[bytes], content_type: str = "") -> str:
+    """请求体转可安全入日志的字符串：二进制表单（如音频上传）只记摘要，其余宽松解码。"""
+    if not body:
+        return ""
+    ct = (content_type or "").lower()
+    if ct.startswith(("multipart/form-data", "application/x-www-form-urlencoded")):
+        return f"<form body, {len(body)} bytes, content-type={ct.split(';')[0].strip()}>"
+    return body.decode("utf-8", errors="replace")
+
+
+def _form_fields_for_log(form) -> str:
+    """提取表单文本字段用于日志；文件字段只记文件名与大小，不记内容。"""
+    fields = {}
+    for key, value in form.multi_items():
+        if isinstance(value, str):
+            fields[key] = value
+        else:
+            fields[key] = f"<file {value.filename}, {value.size} bytes>"
+    return json.dumps(fields, ensure_ascii=False)
+
+
 def _apply_accept_encoding(headers: dict, disable_compression: bool) -> None:
     """渠道级压缩控制：disable_compression 时强制 identity（兼容压缩却不回传 Content-Encoding 的上游）；否则交给 httpx 自行协商（合规上游会回传 Content-Encoding，可正常解压）。"""
     if disable_compression:
@@ -716,8 +737,8 @@ async def forward_streaming_request(
                         "path": path,
                         "request_url": url,
                         "request_headers": headers,
-                        "request_body": (
-                            body.decode("utf-8", errors="replace") if body else ""
+                        "request_body": _body_for_log(
+                            body, headers.get("content-type", "")
                         ),
                         "response_status": response_status,
                         "response_headers": response_headers,
@@ -765,6 +786,7 @@ async def forward_streaming_request(
 async def forward_request(
     request: Request, path: str, backend_url: str, api_key: Optional[str] = None, provider: str = "",
     *, proxy_url: Optional[str] = None, disable_ssl: bool = False, disable_compression: bool = False,
+    fallback_model: Optional[str] = None,
 ) -> Response:
     """
     转发请求到后端服务并返回响应。
@@ -820,6 +842,11 @@ async def forward_request(
             is_stream_request = body_json_parsed.get("stream", False)
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         pass
+
+    # 表单类请求（如 ASR 音频上传）body 不是 JSON，使用路由层解析出的模型名，
+    # 保证日志与用量记录里的 model 不为空
+    if model_name is None:
+        model_name = fallback_model
 
     # 如果请求要求流式，使用流式转发
     if is_stream_request:
@@ -910,8 +937,8 @@ async def forward_request(
                         "path": path,
                         "request_url": url,
                         "request_headers": dict(headers),
-                        "request_body": (
-                            body.decode("utf-8", errors="replace") if body else ""
+                        "request_body": _body_for_log(
+                            body, headers.get("content-type", "")
                         ),
                         "response_status": response.status_code,
                         "response_headers": response_headers,
@@ -1010,7 +1037,9 @@ async def forward_request(
                     "path": path,
                     "request_url": url,
                     "request_headers": dict(headers),
-                    "request_body": body.decode("utf-8") if body else "",
+                    "request_body": _body_for_log(
+                        body, headers.get("content-type", "")
+                    ),
                     "response_status": 0,
                     "response_headers": {},
                     "response_body": f"Error: {str(e)}",
@@ -1041,7 +1070,9 @@ async def forward_request(
                     "path": path,
                     "request_url": url,
                     "request_headers": dict(headers),
-                    "request_body": body.decode("utf-8") if body else "",
+                    "request_body": _body_for_log(
+                        body, headers.get("content-type", "")
+                    ),
                     "response_status": 0,
                     "response_headers": {},
                     "response_body": f"Error: {str(e)}",
@@ -1651,11 +1682,42 @@ async def gateway(request: Request, path: str):
             status_code=402,
         )
 
-    # 读取请求体
-    body = await request.json()
+    # 读取请求体：JSON 走原有解析；表单类（multipart/urlencoded，如 ASR 音频上传）
+    # 解析出 model 字段用于路由，body 原始字节透传，不做 JSON 改写
+    raw_body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    is_form_request = content_type.lower().startswith(
+        ("multipart/form-data", "application/x-www-form-urlencoded")
+    )
 
-    # 尝试从请求体中提取模型名称
-    model_name = body.get("model")
+    if is_form_request:
+        try:
+            form = await request.form()
+        except Exception as e:
+            logger.warning(f"表单解析失败: {e}")
+            await log_writer.enqueue_rejection_log(
+                request, status=400, error="malformed form body",
+                request_body=f"<form body, {len(raw_body)} bytes>")
+            return JSONResponse(
+                content={"error": "malformed form body"}, status_code=400
+            )
+        model_name = form.get("model")
+        if not isinstance(model_name, str):
+            model_name = None
+        body = None
+        rejection_body_log = _form_fields_for_log(form)
+    else:
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, ValueError):
+            await log_writer.enqueue_rejection_log(
+                request, status=400, error="invalid JSON body",
+                request_body=raw_body.decode("utf-8", errors="replace")[:512])
+            return JSONResponse(
+                content={"error": "invalid JSON body"}, status_code=400
+            )
+        model_name = body.get("model") if isinstance(body, dict) else None
+        rejection_body_log = json.dumps(body, ensure_ascii=False)
     api_key = None
     backend_provider = ""
 
@@ -1677,10 +1739,13 @@ async def gateway(request: Request, path: str):
             ch_disable_ssl = bool(backend_info.get("disable_ssl", False))
             ch_disable_compression = bool(backend_info.get("disable_compression", False))
             logger.info(f"Found backend for model {backend_info}")
-            body["model"] = model_name
+            # 表单请求无法改写 body 中的 model（原始字节透传），
+            # 即 model_mapping 映射对表单端点不生效
+            if body is not None:
+                body["model"] = model_name
         else:
             token_username = getattr(request.state, "token_username", None)
-            _rb = json.dumps(body, ensure_ascii=False)
+            _rb = rejection_body_log
             if not token_username:
                 await log_writer.enqueue_rejection_log(
                     request, status=401, error="anonymous token is not allowed",
@@ -1698,15 +1763,17 @@ async def gateway(request: Request, path: str):
     else:
         await log_writer.enqueue_rejection_log(
             request, status=400, error="No model name provided",
-            request_body=json.dumps(body, ensure_ascii=False))
+            request_body=rejection_body_log)
         return JSONResponse(
             content={"error": "No model name provided"}, status_code=400
         )
 
     # 重新构建请求（因为已经读取了 body）
+    forward_body = json.dumps(body).encode("utf-8") if body is not None else raw_body
+
     class RequestWithBody(Request):
         async def body(self) -> bytes:
-            return json.dumps(body).encode("utf-8")
+            return forward_body
 
     new_request = RequestWithBody(request.scope, request.receive)
 
@@ -1714,6 +1781,7 @@ async def gateway(request: Request, path: str):
         new_request, path, backend_url, api_key, backend_provider,
         proxy_url=ch_proxy_url, disable_ssl=ch_disable_ssl,
         disable_compression=ch_disable_compression,
+        fallback_model=model_name,
     )
 
 

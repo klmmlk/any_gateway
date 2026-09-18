@@ -17,6 +17,13 @@ pyrightconfig.json
 
 # 环境变量文件（含密钥，切勿提交）
 .env
+.redis_pwd
+
+# 本地基准测试脚本与数据（含真实 API key，切勿提交）
+bench_*
+
+# ZCode 会话目录
+.zcode/
 
 AGENTS.md
 CLAUDE.md
