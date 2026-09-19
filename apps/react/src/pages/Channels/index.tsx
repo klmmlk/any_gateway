@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Table,
   Button,
@@ -15,15 +15,17 @@ import {
   Typography,
   Grid,
   Modal,
+  Checkbox,
+  Spin,
 } from '@arco-design/web-react'
-import { IconPlus, IconDelete, IconRefresh } from '@arco-design/web-react/icon'
+import { IconPlus, IconDelete, IconRefresh, IconSettings, IconSearch } from '@arco-design/web-react/icon'
 import type { ColumnProps } from '@arco-design/web-react/es/Table'
 import {
   getChannels,
   createChannel,
   updateChannel,
   deleteChannel,
-  fetchChannelModels,
+  getUpstreamModels,
   type Channel,
 } from '../../api/channels'
 
@@ -96,10 +98,27 @@ const Channels: React.FC = () => {
   const [drawerVisible, setDrawerVisible] = useState(false)
   const [editingChannel, setEditingChannel] = useState<Channel | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [fetchingModels, setFetchingModels] = useState<string | null>(null)
   const [mappings, setMappings] = useState<Mapping[]>([])
-  const [viewModelsChannel, setViewModelsChannel] = useState<Channel | null>(null)
-  const [deletingModel, setDeletingModel] = useState<string | null>(null)
+  // 管理模型弹窗：选中项 + 上游候选（null = 尚未加载）
+  const [managingChannel, setManagingChannel] = useState<Channel | null>(null)
+  const [selectedModels, setSelectedModels] = useState<string[]>([])
+  const [upstreamIds, setUpstreamIds] = useState<string[] | null>(null)
+  const [loadingUpstream, setLoadingUpstream] = useState(false)
+  const [savingModels, setSavingModels] = useState(false)
+  const [modelSearch, setModelSearch] = useState('')
+  const [manualModel, setManualModel] = useState('')
+  // 每渠道缓存上游候选：打开弹窗直接复用，仅 ⟳ 按钮强制重新拉取
+  const [upstreamCache, setUpstreamCache] = useState<Record<string, string[]>>({})
+  const upstreamFetchSeq = useRef(0)
+
+  // 弹窗内派生值：候选 / 自定义（不在候选中的已选，含映射别名）/ 搜索过滤结果
+  const upstreamList = upstreamIds ?? []
+  const mappingKeySet = new Set(parseMappingKeys(managingChannel?.model_mapping ?? null))
+  const modelKeyword = modelSearch.trim().toLowerCase()
+  const matchKeyword = (id: string) => !modelKeyword || id.toLowerCase().includes(modelKeyword)
+  const customIds = selectedModels.filter((id) => !upstreamList.includes(id))
+  const visibleCustom = customIds.filter(matchKeyword)
+  const visibleUpstream = upstreamList.filter(matchKeyword)
 
   const [form] = Form.useForm()
 
@@ -231,60 +250,93 @@ const Channels: React.FC = () => {
     }
   }
 
-  const handleFetchModels = async (id: string) => {
-    setFetchingModels(id)
-    try {
-      await fetchChannelModels(id)
-      Message.success('模型列表已更新')
-      fetchData()
-    } catch {
-      Message.error('获取模型失败')
-    } finally {
-      setFetchingModels(null)
+  // ------ 管理模型弹窗 ------------------------------------------------------
+
+  const openManageModels = (channel: Channel) => {
+    setManagingChannel(channel)
+    setSelectedModels(parseModelIds(channel.models, channel.model_mapping))
+    setModelSearch('')
+    setManualModel('')
+    const cached = upstreamCache[channel.id]
+    if (cached) {
+      setUpstreamIds(cached)
+    } else {
+      setUpstreamIds(null)
+      void loadUpstreamModels(channel.id)
     }
   }
 
-  const handleRemoveModel = async (modelId: string) => {
-    if (!viewModelsChannel) return
-    setDeletingModel(modelId)
+  const loadUpstreamModels = async (id: string, force = false) => {
+    if (!force && upstreamCache[id]) {
+      setUpstreamIds(upstreamCache[id])
+      return
+    }
+    const seq = ++upstreamFetchSeq.current
+    setLoadingUpstream(true)
     try {
-      // 从 models 数组中移除
-      let newModels = viewModelsChannel.models
+      const res = await getUpstreamModels(id)
+      if (seq !== upstreamFetchSeq.current) return // 已切换到其他渠道/更新请求，丢弃过期响应
+      const ids: string[] = res.data?.models ?? []
+      setUpstreamCache((prev) => ({ ...prev, [id]: ids }))
+      setUpstreamIds(ids)
+    } catch {
+      if (seq !== upstreamFetchSeq.current) return
+      // 拉取失败不阻塞：弹窗仍可通过手动添加编辑；失败结果不写缓存，下次打开自动重试
+      setUpstreamIds([])
+      Message.warning('上游模型列表获取失败，可手动添加模型名')
+    } finally {
+      if (seq === upstreamFetchSeq.current) setLoadingUpstream(false)
+    }
+  }
+
+  const toggleModel = (id: string, checked: boolean) => {
+    setSelectedModels((prev) =>
+      checked ? (prev.includes(id) ? prev : [...prev, id]) : prev.filter((x) => x !== id),
+    )
+  }
+
+  const selectAllVisible = () => {
+    setSelectedModels((prev) => Array.from(new Set([...prev, ...visibleCustom, ...visibleUpstream])))
+  }
+
+  const addManualModel = () => {
+    const id = manualModel.trim()
+    if (!id) return
+    if (selectedModels.includes(id)) {
+      Message.info('该模型已在列表中')
+      return
+    }
+    setSelectedModels((prev) => [...prev, id])
+    setManualModel('')
+  }
+
+  const handleSaveModels = async () => {
+    if (!managingChannel) return
+    const ids = Array.from(new Set(selectedModels.map((s) => s.trim()).filter(Boolean)))
+    setSavingModels(true)
+    try {
+      // 同步清理 model_mapping 中已不在选中集内的 key（沿用原删除语义）
+      let mappingObj: Record<string, string> = {}
       try {
-        const list: unknown[] = JSON.parse(viewModelsChannel.models || '[]')
-        const filtered = list.filter((m) => {
-          const id = m && typeof m === 'object' && 'id' in m
-            ? String((m as { id: unknown }).id)
-            : String(m)
-          return id !== modelId
-        })
-        newModels = JSON.stringify(filtered)
+        mappingObj = JSON.parse(managingChannel.model_mapping || '{}')
       } catch {
         // noop
       }
+      parseMappingKeys(managingChannel.model_mapping).forEach((key) => {
+        if (!ids.includes(key)) delete mappingObj[key]
+      })
 
-      // 从 model_mapping 中移除
-      let newMapping = viewModelsChannel.model_mapping
-      try {
-        const obj = JSON.parse(viewModelsChannel.model_mapping || '{}')
-        if (modelId in obj) {
-          delete obj[modelId]
-          newMapping = JSON.stringify(obj)
-        }
-      } catch {
-        // noop
-      }
-
-      await updateChannel(viewModelsChannel.id, { models: newModels, model_mapping: newMapping })
-      // 同步更新 viewModelsChannel 避免关闭再刷新
-      setViewModelsChannel((prev) =>
-        prev ? { ...prev, models: newModels, model_mapping: newMapping } : null,
-      )
+      await updateChannel(managingChannel.id, {
+        models: JSON.stringify(ids),
+        model_mapping: JSON.stringify(mappingObj),
+      })
+      Message.success(`已保存 ${ids.length} 个模型`)
+      setManagingChannel(null)
       fetchData()
     } catch {
-      Message.error('删除模型失败')
+      Message.error('保存失败')
     } finally {
-      setDeletingModel(null)
+      setSavingModels(false)
     }
   }
 
@@ -357,12 +409,11 @@ const Channels: React.FC = () => {
       align: 'center',
       render: (models: string | null, record: Channel) => {
         const count = parseModelsCount(models, record.model_mapping)
-        if (count === 0) return <Tag color="gray">0</Tag>
         return (
           <Tag
-            color="arcoblue"
+            color={count === 0 ? 'gray' : 'arcoblue'}
             style={{ cursor: 'pointer' }}
-            onClick={() => setViewModelsChannel(record)}
+            onClick={() => openManageModels(record)}
           >
             {count}
           </Tag>
@@ -381,11 +432,10 @@ const Channels: React.FC = () => {
           <Button
             size="small"
             type="text"
-            icon={<IconRefresh />}
-            loading={fetchingModels === record.id}
-            onClick={() => handleFetchModels(record.id)}
+            icon={<IconSettings />}
+            onClick={() => openManageModels(record)}
           >
-            获取模型
+            管理模型
           </Button>
           <Popconfirm
             title="确定要删除此 Channel 吗？"
@@ -435,37 +485,148 @@ const Channels: React.FC = () => {
         />
       </div>
 
-      {/* 模型列表查看 Modal */}
+      {/* 管理模型 Modal：上游候选勾选列表 + 搜索 + 手动添加 */}
       <Modal
-        title={`${viewModelsChannel?.name ?? ''} — 模型列表`}
-        visible={!!viewModelsChannel}
-        onCancel={() => setViewModelsChannel(null)}
+        title={`${managingChannel?.name ?? ''} — 管理模型`}
+        visible={!!managingChannel}
+        onCancel={() => setManagingChannel(null)}
         footer={
-          <Button onClick={() => setViewModelsChannel(null)}>关闭</Button>
+          <Space>
+            <Button onClick={() => setManagingChannel(null)}>取消</Button>
+            <Button type="primary" loading={savingModels} onClick={handleSaveModels}>
+              保存 ({selectedModels.length})
+            </Button>
+          </Space>
         }
-        style={{ maxWidth: 480 }}
+        style={{ width: 640, maxWidth: '92vw' }}
       >
+        {/* 搜索 + 手动添加（阿里云等无 /models 端点的渠道靠手动添加） */}
+        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+          <Input
+            style={{ flex: 1 }}
+            allowClear
+            prefix={<IconSearch />}
+            placeholder="搜索模型…"
+            value={modelSearch}
+            onChange={setModelSearch}
+          />
+          <Input
+            style={{ width: 220 }}
+            allowClear
+            placeholder="手动添加模型名，回车确认"
+            value={manualModel}
+            onChange={setManualModel}
+            onPressEnter={addManualModel}
+          />
+          <Button icon={<IconPlus />} onClick={addManualModel} />
+        </div>
+
         <div
           style={{
-            maxHeight: 400,
-            overflowY: 'auto',
             display: 'flex',
-            flexWrap: 'wrap',
-            gap: 8,
-            padding: '4px 0',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 4,
           }}
         >
-          {parseModelIds(viewModelsChannel?.models ?? null, viewModelsChannel?.model_mapping ?? null).map((id) => (
-            <Tag
-              key={id}
-              color="arcoblue"
-              closable
-              onClose={() => handleRemoveModel(id)}
-              style={{ marginBottom: 0, opacity: deletingModel === id ? 0.5 : 1 }}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {upstreamIds === null
+              ? '正在从上游获取候选…'
+              : `上游候选 ${upstreamList.length} · 显示 ${visibleCustom.length + visibleUpstream.length} · 已选 ${selectedModels.length}`}
+          </Typography.Text>
+          <Space size="small">
+            <Button
+              size="mini"
+              type="text"
+              disabled={visibleCustom.length + visibleUpstream.length === 0}
+              onClick={selectAllVisible}
             >
-              {id}
-            </Tag>
-          ))}
+              全选
+            </Button>
+            <Button
+              size="mini"
+              type="text"
+              status="danger"
+              disabled={selectedModels.length === 0}
+              onClick={() => setSelectedModels([])}
+            >
+              清空勾选
+            </Button>
+            <Button
+              size="mini"
+              type="text"
+              icon={<IconRefresh />}
+              loading={loadingUpstream}
+              onClick={() => managingChannel && loadUpstreamModels(managingChannel.id, true)}
+            />
+          </Space>
+        </div>
+
+        <div
+          style={{
+            border: '1px solid var(--color-border-2)',
+            borderRadius: 4,
+            maxHeight: 360,
+            overflowY: 'auto',
+          }}
+        >
+          {upstreamIds === null && loadingUpstream ? (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}>
+              <Spin />
+            </div>
+          ) : visibleCustom.length + visibleUpstream.length === 0 ? (
+            <Typography.Text
+              type="secondary"
+              style={{ display: 'block', textAlign: 'center', padding: '32px 0', fontSize: 12 }}
+            >
+              {upstreamList.length === 0 && customIds.length === 0
+                ? '上游无候选，可在上方手动添加模型名'
+                : '无匹配模型'}
+            </Typography.Text>
+          ) : (
+            <>
+              {[...visibleCustom, ...visibleUpstream].map((id) => {
+                const isCustom = customIds.includes(id)
+                return (
+                  <div
+                    key={id}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '5px 12px',
+                      cursor: 'pointer',
+                    }}
+                    onClick={() => toggleModel(id, !selectedModels.includes(id))}
+                  >
+                    <Checkbox checked={selectedModels.includes(id)} />
+                    <span
+                      style={{
+                        flex: 1,
+                        fontFamily: 'monospace',
+                        fontSize: 12,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {id}
+                    </span>
+                    {mappingKeySet.has(id) && (
+                      <Tag color="orange" style={{ fontSize: 11, marginBottom: 0 }}>
+                        映射
+                      </Tag>
+                    )}
+                    {isCustom && !mappingKeySet.has(id) && (
+                      <Tag color="gray" style={{ fontSize: 11, marginBottom: 0 }}>
+                        手动
+                      </Tag>
+                    )}
+                  </div>
+                )
+              })}
+            </>
+          )}
         </div>
       </Modal>
 

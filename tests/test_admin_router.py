@@ -1228,6 +1228,115 @@ def test_fetch_channel_models_keeps_more_than_500_models(client):
     assert len(body["models"]) == 600
 
 
+def test_get_channel_upstream_models_readonly(client):
+    """upstream-models 只读：返回归一化 id 列表，且不修改 Channel.models。"""
+    from unittest.mock import patch
+
+    admin_headers = {"x-admin-key": "test-admin-secret"}
+
+    client.post(
+        "/admin/channels",
+        json={
+            "name": "upstream-models-readonly",
+            "provider": "openai",
+            "base_url": "https://example.com/v1",
+            "api_key": "fake-key",
+            "models": '["existing-model"]',
+            "enabled": True,
+            "weight": 1,
+        },
+        headers=admin_headers,
+    )
+    channels_resp = client.get("/admin/channels", headers=admin_headers).json()
+    channel = next(c for c in channels_resp["data"] if c["name"] == "upstream-models-readonly")
+
+    # dict / str 混合格式 + 重复项，验证归一化与去重
+    fake_models = [{"id": "upstream-a"}, {"id": "upstream-b"}, "upstream-a"]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": fake_models}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            return FakeResponse()
+
+    with patch("admin.router.httpx.AsyncClient", FakeAsyncClient):
+        res = client.get(
+            f"/admin/channels/{channel['id']}/upstream-models",
+            headers=admin_headers,
+        )
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["models"] == ["upstream-a", "upstream-b"]
+    assert body["count"] == 2
+
+    # 只读：Channel.models 保持不变
+    after = client.get(f"/admin/channels/{channel['id']}", headers=admin_headers).json()
+    assert after["models"] == '["existing-model"]'
+
+
+def test_get_channel_upstream_models_errors(client):
+    """upstream-models：渠道不存在 404；上游连接失败 502。"""
+    from unittest.mock import patch
+
+    import httpx
+
+    admin_headers = {"x-admin-key": "test-admin-secret"}
+
+    res = client.get("/admin/channels/nonexistent-id/upstream-models", headers=admin_headers)
+    assert res.status_code == 404
+
+    client.post(
+        "/admin/channels",
+        json={
+            "name": "upstream-models-conn-error",
+            "provider": "openai",
+            "base_url": "https://example.com/v1",
+            "api_key": "fake-key",
+            "enabled": True,
+            "weight": 1,
+        },
+        headers=admin_headers,
+    )
+    channels_resp = client.get("/admin/channels", headers=admin_headers).json()
+    channel = next(c for c in channels_resp["data"] if c["name"] == "upstream-models-conn-error")
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            raise httpx.ConnectError("boom")
+
+    with patch("admin.router.httpx.AsyncClient", FakeAsyncClient):
+        res = client.get(
+            f"/admin/channels/{channel['id']}/upstream-models",
+            headers=admin_headers,
+        )
+    assert res.status_code == 502
+
+
 def test_group_all_visible_field(client):
     """UserGroup 应支持 all_visible 字段"""
     res = client.post(

@@ -42,5 +42,5 @@ export const updateChannel = (id: string, data: Partial<ChannelCreate>) =>
 export const deleteChannel = (id: string) =>
   client.delete(`/admin/channels/${id}`)
 
-export const fetchChannelModels = (id: string) =>
-  client.post(`/admin/channels/${id}/fetch-models`)
+export const getUpstreamModels = (id: string) =>
+  client.get(`/admin/channels/${id}/upstream-models`)

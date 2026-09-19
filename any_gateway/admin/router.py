@@ -1015,19 +1015,13 @@ admin_router = APIRouter(
 # ------ 从上游拉取模型列表 --------------------------------------------------
 
 
-@admin_router.post("/channels/{channel_id}/fetch-models", summary="从上游拉取模型列表")
-async def fetch_channel_models(
-    channel_id: str,
-    session: AsyncSession = Depends(async_session_generator),
-) -> dict:
-    """向上游 API 发送 GET /models 请求，将返回的模型列表存储到 Channel.models（JSON 格式）。"""
-    crud = FastCRUD(Channel)
-    channel = await crud.get(session, id=channel_id)
-    # FastCRUD.get() 返回 dict | None（无 schema_to_select 时）
-    if channel is None:
-        raise HTTPException(status_code=404, detail="Channel not found")
+async def _fetch_upstream_models(channel: dict) -> list:
+    """向上游发送模型列表请求，返回解析/归一化后的模型条目列表（不落库）。
 
-    # 向上游拉取模型
+    - 端点路径按协议：anthropic /v1/models、gemini /v1beta/models、其余 /models
+    - 解析 OpenAI 格式（data 字段）与其他格式（models 字段）
+    - Gemini 原生格式归一化：过滤仅支持 generateContent 的模型，strip models/ 前缀
+    """
     provider = (channel.get("provider") or "").lower()
     base = channel["base_url"].rstrip("/")
 
@@ -1056,60 +1050,6 @@ async def fetch_channel_models(
             resp = await client.get(models_url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
-
-        logger.info(
-            f"fetch-models 响应 keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
-        )
-
-        # 支持 OpenAI 格式（data 字段）和其他格式
-        if "data" in data:
-            models = data["data"]
-        elif "models" in data:
-            models = data["models"]
-        else:
-            models = []
-            logger.warning(f"fetch-models 未识别的响应格式，raw={str(data)[:300]}")
-
-        if not models:
-            logger.warning(f"fetch-models 返回空模型列表，channel={channel_id}")
-
-        # Gemini 原生格式规范化：name="models/gemini-xxx"，过滤仅支持 generateContent 的模型
-        if provider == "gemini":
-            normalized = []
-            for m in models:
-                if not isinstance(m, dict):
-                    continue
-                methods = m.get("supportedGenerationMethods") or []
-                if "generateContent" not in methods:
-                    continue
-                model_id = (m.get("name") or "").removeprefix("models/")
-                if model_id:
-                    normalized.append(
-                        {
-                            "id": model_id,
-                            "object": "model",
-                            "created": 0,
-                            "owned_by": "gemini",
-                        }
-                    )
-            models = normalized
-
-        # 截断过大的模型列表
-        MAX_MODELS = 100000
-        if len(models) > MAX_MODELS:
-            logger.warning(
-                f"Channel {channel_id} 返回 {len(models)} 个模型，截断至 {MAX_MODELS}"
-            )
-            models = models[:MAX_MODELS]
-
-        logger.info(f"fetch-models 保存 {len(models)} 个模型到 channel={channel_id}")
-
-        # 存储为 JSON string
-        models_json = json.dumps(models, ensure_ascii=False)
-        await crud.update(session, object={"models": models_json}, id=channel_id)
-
-        return {"ok": True, "count": len(models), "models": models}
-
     except httpx.HTTPStatusError as e:
         body = e.response.text[:300]
         logger.error(f"fetch-models 上游错误 {e.response.status_code}: {body}")
@@ -1118,6 +1058,107 @@ async def fetch_channel_models(
         )
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"连接上游失败: {str(e)}")
+
+    logger.info(
+        f"fetch-models 响应 keys={list(data.keys()) if isinstance(data, dict) else type(data)}"
+    )
+
+    # 支持 OpenAI 格式（data 字段）和其他格式
+    if isinstance(data, dict) and "data" in data:
+        models = data["data"]
+    elif isinstance(data, dict) and "models" in data:
+        models = data["models"]
+    else:
+        models = []
+        logger.warning(f"fetch-models 未识别的响应格式，raw={str(data)[:300]}")
+
+    if not models:
+        logger.warning(f"fetch-models 返回空模型列表，channel={channel.get('id')}")
+
+    # Gemini 原生格式规范化：name="models/gemini-xxx"，过滤仅支持 generateContent 的模型
+    if provider == "gemini":
+        normalized = []
+        for m in models:
+            if not isinstance(m, dict):
+                continue
+            methods = m.get("supportedGenerationMethods") or []
+            if "generateContent" not in methods:
+                continue
+            model_id = (m.get("name") or "").removeprefix("models/")
+            if model_id:
+                normalized.append(
+                    {
+                        "id": model_id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "gemini",
+                    }
+                )
+        models = normalized
+
+    # 截断过大的模型列表
+    MAX_MODELS = 100000
+    if len(models) > MAX_MODELS:
+        logger.warning(
+            f"Channel {channel.get('id')} 返回 {len(models)} 个模型，截断至 {MAX_MODELS}"
+        )
+        models = models[:MAX_MODELS]
+    return models
+
+
+def _model_ids(items: list) -> list[str]:
+    """从模型条目列表（str 或 {id|name} dict）提取去重且保序的模型 id（strip models/ 前缀）。"""
+    ids: list[str] = []
+    for m in items:
+        raw = (m.get("id") or m.get("name") or "") if isinstance(m, dict) else str(m)
+        mid = raw.removeprefix("models/")
+        if mid and mid not in ids:
+            ids.append(mid)
+    return ids
+
+
+@admin_router.get(
+    "/channels/{channel_id}/upstream-models",
+    summary="从上游拉取模型列表（只读，不落库）",
+)
+async def get_channel_upstream_models(
+    channel_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """拉取上游模型列表，返回归一化的 id 列表，供前端勾选后再保存。"""
+    crud = FastCRUD(Channel)
+    channel = await crud.get(session, id=channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    ids = _model_ids(await _fetch_upstream_models(channel))
+    return {"ok": True, "count": len(ids), "models": ids}
+
+
+@admin_router.post(
+    "/channels/{channel_id}/fetch-models",
+    summary="从上游拉取模型列表（全量覆盖保存，推荐改用 upstream-models + PATCH）",
+)
+async def fetch_channel_models(
+    channel_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """向上游 API 发送 GET /models 请求，将返回的模型列表全量覆盖存储到 Channel.models（JSON 格式）。"""
+    crud = FastCRUD(Channel)
+    channel = await crud.get(session, id=channel_id)
+    # FastCRUD.get() 返回 dict | None（无 schema_to_select 时）
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    models = await _fetch_upstream_models(channel)
+
+    logger.info(f"fetch-models 保存 {len(models)} 个模型到 channel={channel_id}")
+
+    # 存储为 JSON string
+    models_json = json.dumps(models, ensure_ascii=False)
+    await crud.update(session, object={"models": models_json}, id=channel_id)
+
+    return {"ok": True, "count": len(models), "models": models}
 
 
 # ------ 日志查询接口 ---------------------------------------------------------
