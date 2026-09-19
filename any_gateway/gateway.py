@@ -645,73 +645,165 @@ async def forward_streaming_request(
     disable_compression: bool = False,
 ) -> StreamingResponse:
     """
-    转发流式请求到后端服务并返回 SSE 流式响应。
-    累积所有响应内容用于日志记录。
+    转发流式请求到后端服务。
+
+    - 上游 content-type 为 text/event-stream：按行转发 SSE（聊天流式），
+      累积响应内容用于日志记录与 usage 解析。
+    - 其他 content-type（如 TTS 的 audio/wav 分块音频）：原始字节透传并
+      保留上游 content-type，不做文本解码、不注入换行，避免破坏二进制流。
     """
-    # 用于累积所有响应内容（用于日志）
+    # 用于累积 SSE 响应内容（用于日志与 usage 解析）；二进制流只记字节数
     accumulated_chunks = []
     response_status = 0
     response_headers = {}
     error_message = None
+    binary_bytes = 0
+
+    def _finalize_and_log(duration_ms: float) -> None:
+        if accumulated_chunks:
+            response_body_for_log = "".join(accumulated_chunks)
+        elif binary_bytes:
+            response_body_for_log = f"<binary stream, {binary_bytes} bytes>"
+        else:
+            response_body_for_log = ""
+        task = asyncio.create_task(
+            log_writer.enqueue_log(
+                {
+                    "timestamp": timestamp(),
+                    "method": request.method,
+                    "path": path,
+                    "request_url": url,
+                    "request_headers": headers,
+                    "request_body": _body_for_log(
+                        body, headers.get("content-type", "")
+                    ),
+                    "response_status": response_status,
+                    "response_headers": response_headers,
+                    "response_body": response_body_for_log,
+                    "duration_ms": duration_ms,
+                    "model_name": model_name,
+                    "backend_url": backend_url,
+                    "is_stream": True,
+                    "error": error_message,
+                    "token_id": getattr(request.state, "token_id", None),
+                    "request_id": request_id,
+                }
+            )
+        )
+        app.state.log_tasks.add(task)
+        task.add_done_callback(app.state.log_tasks.discard)
+        finalize_task = asyncio.create_task(
+            _finalize_stream_usage(
+                request=request,
+                request_id=request_id,
+                model_name=model_name,
+                duration_ms=duration_ms,
+                response_status=response_status,
+                accumulated_chunks=accumulated_chunks,
+                provider=provider,
+            )
+        )
+        app.state.log_tasks.add(finalize_task)
+        finalize_task.add_done_callback(app.state.log_tasks.discard)
+
+    client = httpx.AsyncClient(
+        **_httpx_client_kwargs(TIMEOUT_BOUND, disable_ssl=disable_ssl, proxy_url=proxy_url)
+    )
+    try:
+        upstream_request = client.build_request(
+            method=request.method,
+            url=url,
+            content=body if body else None,
+            headers=headers,
+        )
+        response = await client.send(upstream_request, stream=True, follow_redirects=True)
+    except Exception as e:
+        await client.aclose()
+        error_message = (
+            f"Request error: {str(e)}"
+            if isinstance(e, httpx.RequestError)
+            else f"Unexpected error: {str(e)}"
+        )
+        logger.error(f"Streaming error: {error_message}")
+        error_chunk = f"data: {json.dumps({'error': {'message': error_message, 'code': 0}})}\n\n"
+        accumulated_chunks.append(error_chunk)
+        _finalize_and_log((time.time() - start_time) * 1000)
+
+        async def error_stream():
+            yield error_chunk.encode("utf-8")
+
+        return StreamingResponse(
+            error_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 记录响应状态和头部（需在流式转发前拿到，用于判断 SSE / 二进制）
+    response_status = response.status_code
+    response_headers = dict(response.headers)
+    response_headers.pop("content-encoding", None)
+    response_headers.pop("content-length", None)
+
+    logger.info(
+        f"Streaming response started: status={response_status}, content-type={response_headers.get('content-type')}"
+    )
+
+    upstream_content_type = (response_headers.get("content-type") or "").lower()
+    is_sse = upstream_content_type.startswith("text/event-stream")
+    media_type = (
+        "text/event-stream"
+        if is_sse
+        else (response_headers.get("content-type") or "application/octet-stream")
+    )
 
     async def stream_generator():
-        nonlocal response_status, response_headers, error_message
+        nonlocal error_message, binary_bytes
 
         try:
-            async with httpx.AsyncClient(
-                **_httpx_client_kwargs(TIMEOUT_BOUND, disable_ssl=disable_ssl, proxy_url=proxy_url)
-            ) as client:
-                async with client.stream(
-                    method=request.method,
-                    url=url,
-                    content=body if body else None,
-                    headers=headers,
-                    follow_redirects=True,
-                ) as response:
-                    # 记录响应状态和头部
-                    response_status = response.status_code
-                    response_headers = dict(response.headers)
-                    response_headers.pop("content-encoding", None)
-                    response_headers.pop("content-length", None)
+            if response_status >= 400:
+                # 上游返回 4xx/5xx：读取错误体并包装为 SSE error 事件
+                error_body_parts: list[str] = []
+                async for line in response.aiter_lines():
+                    error_body_parts.append(line)
+                error_body = "\n".join(error_body_parts)
+                accumulated_chunks.append(error_body)
 
-                    logger.info(
-                        f"Streaming response started: status={response_status}, content-type={response_headers.get('content-type')}"
-                    )
+                try:
+                    error_json = json.loads(error_body)
+                    # 标准化为 {"error": {"message": ..., "code": ...}}
+                    if "error" not in error_json:
+                        error_json = {"error": {"message": str(error_json), "code": response_status}}
+                    elif isinstance(error_json["error"], str):
+                        error_json = {"error": {"message": error_json["error"], "code": response_status}}
+                except Exception:
+                    # 非 JSON 响应（如 nginx HTML 502 页面）：只传状态码，不传原始 HTML
+                    error_json = {"error": {"message": f"上游服务异常 (HTTP {response_status})", "code": response_status}}
 
-                    # 上游返回 4xx/5xx：读取错误体并包装为 SSE error 事件
-                    if response_status >= 400:
-                        error_body_parts: list[str] = []
-                        async for line in response.aiter_lines():
-                            error_body_parts.append(line)
-                        error_body = "\n".join(error_body_parts)
-                        accumulated_chunks.append(error_body)
+                error_message = error_json["error"].get("message", "") if isinstance(error_json.get("error"), dict) else str(error_json.get("error"))
+                logger.warning(f"Streaming upstream error {response_status}: {error_message}")
+                error_chunk = f"data: {json.dumps(error_json, ensure_ascii=False)}\n\n"
+                accumulated_chunks.append(error_chunk)
+                yield error_chunk.encode("utf-8")
+            elif is_sse:
+                # SSE：逐行读取并转发
+                async for line in response.aiter_lines():
+                    chunk_data = line + "\n"
+                    accumulated_chunks.append(chunk_data)
+                    yield chunk_data.encode("utf-8")
 
-                        try:
-                            error_json = json.loads(error_body)
-                            # 标准化为 {"error": {"message": ..., "code": ...}}
-                            if "error" not in error_json:
-                                error_json = {"error": {"message": str(error_json), "code": response_status}}
-                            elif isinstance(error_json["error"], str):
-                                error_json = {"error": {"message": error_json["error"], "code": response_status}}
-                        except Exception:
-                            # 非 JSON 响应（如 nginx HTML 502 页面）：只传状态码，不传原始 HTML
-                            error_json = {"error": {"message": f"上游服务异常 (HTTP {response_status})", "code": response_status}}
-
-                        error_message = error_json["error"].get("message", "") if isinstance(error_json.get("error"), dict) else str(error_json.get("error"))
-                        logger.warning(f"Streaming upstream error {response_status}: {error_message}")
-                        error_chunk = f"data: {json.dumps(error_json, ensure_ascii=False)}\n\n"
-                        accumulated_chunks.append(error_chunk)
-                        yield error_chunk.encode("utf-8")
-                    else:
-                        # 逐行读取并转发
-                        async for line in response.aiter_lines():
-                            chunk_data = line + "\n"
-                            accumulated_chunks.append(chunk_data)
-                            yield chunk_data.encode("utf-8")
-
-                        logger.info(
-                            f"Streaming completed: {len(accumulated_chunks)} chunks received"
-                        )
+                logger.info(
+                    f"Streaming completed: {len(accumulated_chunks)} chunks received"
+                )
+            else:
+                # 二进制分块响应（如 TTS 流式音频）：原始字节透传
+                async for chunk in response.aiter_bytes():
+                    binary_bytes += len(chunk)
+                    yield chunk
+                logger.info(f"Binary streaming completed: {binary_bytes} bytes forwarded")
 
         except httpx.RequestError as e:
             error_message = f"Request error: {str(e)}"
@@ -728,60 +820,23 @@ async def forward_streaming_request(
             yield error_chunk.encode("utf-8")
 
         finally:
-            # 流结束后记录日志
-            duration_ms = (time.time() - start_time) * 1000
+            await response.aclose()
+            await client.aclose()
+            _finalize_and_log((time.time() - start_time) * 1000)
 
-            task = asyncio.create_task(
-                log_writer.enqueue_log(
-                    {
-                        "timestamp": timestamp(),
-                        "method": request.method,
-                        "path": path,
-                        "request_url": url,
-                        "request_headers": headers,
-                        "request_body": _body_for_log(
-                            body, headers.get("content-type", "")
-                        ),
-                        "response_status": response_status,
-                        "response_headers": response_headers,
-                        "response_body": "".join(accumulated_chunks),
-                        "duration_ms": duration_ms,
-                        "model_name": model_name,
-                        "backend_url": backend_url,
-                        "is_stream": True,
-                        "error": error_message,
-                        "token_id": getattr(request.state, "token_id", None),
-                        "request_id": request_id,
-                    }
-                )
-            )
-            app.state.log_tasks.add(task)
-            task.add_done_callback(app.state.log_tasks.discard)
-            logger.info(f"流式请求日志已入队, 当前task数量: {len(app.state.log_tasks)}")
-
-            finalize_task = asyncio.create_task(
-                _finalize_stream_usage(
-                    request=request,
-                    request_id=request_id,
-                    model_name=model_name,
-                    duration_ms=duration_ms,
-                    response_status=response_status,
-                    accumulated_chunks=accumulated_chunks,
-                    provider=provider,
-                )
-            )
-            app.state.log_tasks.add(finalize_task)
-            finalize_task.add_done_callback(app.state.log_tasks.discard)
+    response_headers_out = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    if not is_sse and response_headers.get("content-disposition"):
+        response_headers_out["content-disposition"] = response_headers["content-disposition"]
 
     # 返回流式响应
     return StreamingResponse(
         stream_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        media_type=media_type,
+        headers=response_headers_out,
     )
 
 
@@ -889,8 +944,15 @@ async def forward_request(
             # 计算耗时
             duration_ms = (time.time() - start_time) * 1000
 
-            # 解码响应体用于日志 (失败时使用 replace 策略)
-            response_body_log = response_content.decode("utf-8", errors="replace")
+            # 解码响应体用于日志 (失败时使用 replace 策略)；
+            # 音频等二进制响应只记摘要，避免日志膨胀与乱码
+            resp_ct = (response_headers.get("content-type") or "").lower()
+            if resp_ct.startswith(("audio/", "image/", "video/")) or resp_ct in (
+                "application/octet-stream", "application/pdf",
+            ):
+                response_body_log = f"<binary response, {len(response_content)} bytes, content-type={resp_ct}>"
+            else:
+                response_body_log = response_content.decode("utf-8", errors="replace")
 
             # 从响应体中提取 token 用量（支持 OpenAI、Anthropic、Gemini 格式）
             input_tokens = 0
