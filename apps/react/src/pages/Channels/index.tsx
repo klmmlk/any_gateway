@@ -58,14 +58,8 @@ function parseMappingKeys(model_mapping: string | null): string[] {
 }
 
 function parseModelsCount(models: string | null, model_mapping: string | null): number {
-  const mappingCount = parseMappingKeys(model_mapping).length
-  let modelsCount = 0
-  try {
-    modelsCount = JSON.parse(models || '[]').length
-  } catch {
-    // noop
-  }
-  return mappingCount + modelsCount
+  // 与弹窗列表、后端路由一致：models ∪ 映射键 去重计数
+  return parseModelIds(models, model_mapping).length
 }
 
 function parseModelIds(models: string | null, model_mapping: string | null): string[] {
@@ -752,6 +746,10 @@ const Channels: React.FC = () => {
               </Button>
             </div>
 
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+              客户端请求的模型名 → 实际发给上游的模型名（两端名称一致时无需配置）
+            </Typography.Text>
+
             {mappings.length === 0 && (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 无映射规则，点击"添加映射"来配置模型名称转换
@@ -762,7 +760,7 @@ const Channels: React.FC = () => {
               <Row key={index} gutter={8} style={{ marginBottom: 8 }} align="center">
                 <Col flex={1}>
                   <Input
-                    placeholder="from（原模型名）"
+                    placeholder="from（客户端请求的模型名）"
                     value={mapping.from}
                     onChange={(v) => updateMapping(index, 'from', v)}
                   />
@@ -770,7 +768,7 @@ const Channels: React.FC = () => {
                 <Col style={{ padding: '0 4px', color: '#999' }}>→</Col>
                 <Col flex={1}>
                   <Input
-                    placeholder="to（目标模型名）"
+                    placeholder="to（发给上游的模型名）"
                     value={mapping.to}
                     onChange={(v) => updateMapping(index, 'to', v)}
                   />
