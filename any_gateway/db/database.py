@@ -78,6 +78,15 @@ async def init_db():
         except Exception:
             pass
 
+    # vouchers 表绑定的分组（兑卡型生成的 key 加入该组，幂等自动加列）
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "ALTER TABLE vouchers ADD COLUMN group_id VARCHAR"
+            ))
+        except Exception:
+            pass
+
     # 确保 default 分组存在（幂等）
     from db.models import UserGroup
     async with AsyncSession(engine, expire_on_commit=False) as session:

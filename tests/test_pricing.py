@@ -330,3 +330,96 @@ def test_redeem_used_voucher_fails(client):
 
     resp2 = client.post("/user/vouchers/redeem", json={"code": code}, headers=headers)
     assert resp2.status_code == 404
+
+
+# ── 消费券绑定分组 / 批量删除 ─────────────────────────────────────────────────
+
+def _get_or_create_group(client, name: str) -> str:
+    def _find():
+        resp = client.get("/admin/groups", headers=ADMIN_HEADERS)
+        data = resp.json().get("data") or []
+        matches = [g for g in data if g["name"] == name]
+        return matches[-1]["id"] if matches else None
+
+    group_id = _find()
+    if group_id is None:
+        client.post("/admin/groups", json={"name": name}, headers=ADMIN_HEADERS)
+        group_id = _find()
+    assert group_id, f"分组 {name} 创建失败"
+    return group_id
+
+
+def test_voucher_binds_group_on_redeem(client):
+    """兑卡型券绑定指定分组，匿名兑换后 key 进入券面分组"""
+    from sqlalchemy import select as sa_select
+    from db.models import Token
+
+    group_id = _get_or_create_group(client, "voucher-group-test")
+
+    resp = client.post("/admin/vouchers", json={
+        "amount_usd": 5.0, "duration_days": 7, "group_id": group_id,
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 201
+    code = resp.json()["code"]
+
+    resp = client.post("/voucher/redeem", json={"code": code})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["group"] == "voucher-group-test"
+
+    async def _token_group():
+        async with AsyncSession(TEST_ENGINE, expire_on_commit=False) as s:
+            tok = (
+                await s.execute(sa_select(Token).where(Token.key == data["key"]))
+            ).scalar_one()
+            return tok.group_id
+
+    assert asyncio.run(_token_group()) == group_id
+
+
+def test_voucher_without_group_falls_back_to_default(client):
+    """未绑组的兑卡型券，兑换后 key 进入 default 组"""
+    client.post("/admin/vouchers", json={
+        "amount_usd": 1.0, "duration_days": 1,
+    }, headers=ADMIN_HEADERS)
+    list_resp = client.get("/admin/vouchers", headers=ADMIN_HEADERS)
+    unused = [
+        v for v in list_resp.json().get("data", [])
+        if not v["used"] and v.get("duration_days") and not v.get("group_id")
+    ]
+    assert unused, "需要有未使用的无分组兑卡型券"
+    resp = client.post("/voucher/redeem", json={"code": unused[-1]["code"]})
+    assert resp.status_code == 200
+    assert resp.json()["group"] == "default"
+
+
+def test_create_voucher_with_unknown_group_rejected(client):
+    """创建券时指定不存在的分组返回 400"""
+    resp = client.post("/admin/vouchers", json={
+        "amount_usd": 1.0, "duration_days": 1, "group_id": "nonexistent-group",
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 400
+
+
+def test_batch_delete_vouchers(client):
+    """批量删除消费券，仅删传入的 id"""
+    ids = []
+    for _ in range(3):
+        resp = client.post("/admin/vouchers", json={
+            "amount_usd": 2.0,
+        }, headers=ADMIN_HEADERS)
+        assert resp.status_code == 201
+        ids.append(resp.json()["id"])
+
+    resp = client.post(
+        "/admin/vouchers/batch-delete",
+        json={"ids": ids[:2]},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 2
+
+    resp = client.get("/admin/vouchers", headers=ADMIN_HEADERS)
+    remain = [v["id"] for v in resp.json().get("data", [])]
+    assert ids[2] in remain
+    assert ids[0] not in remain and ids[1] not in remain

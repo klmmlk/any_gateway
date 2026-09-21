@@ -158,6 +158,8 @@ class VoucherBase(SQLModel):
     expires_at: str | None = None
     # 兑换后生成 API key 的有效天数；None = 兑换走旧逻辑（登录充值余额）
     duration_days: int | None = None
+    # 兑卡型券生成的 key 绑定的分组（决定渠道路由/限流/计价）；None = 兑换时绑 default 组
+    group_id: str | None = Field(default=None, foreign_key="user_groups.id")
 
 
 class Voucher(VoucherBase, table=True):

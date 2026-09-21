@@ -24,7 +24,7 @@ from fastcrud import FastCRUD, crud_router
 from jose import JWTError
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import asc, desc, func, select
+from sqlalchemy import asc, desc, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import async_session_generator
@@ -621,18 +621,27 @@ async def redeem_voucher_anonymously(
     else:
         key_expires_at = None
 
-    # 绑定 default 分组：无分组且无用户名的 token 会被余额检查直接拒绝（429），
-    # 绑定后走分组限流与分组内路由，行为与普通 key 一致
-    group_result = await session.execute(
-        select(UserGroup).where(UserGroup.name == "default")
-    )
-    default_group = group_result.scalar_one_or_none()
+    # 绑定分组：券面指定组优先，否则 default。无分组且无用户名的 token 会被余额检查
+    # 直接拒绝（429），绑定后走分组限流与分组内路由，行为与普通 key 一致
+    group: UserGroup | None = None
+    if voucher.group_id:
+        group = (
+            await session.execute(
+                select(UserGroup).where(UserGroup.id == voucher.group_id)
+            )
+        ).scalar_one_or_none()
+    if group is None:
+        group = (
+            await session.execute(
+                select(UserGroup).where(UserGroup.name == "default")
+            )
+        ).scalar_one_or_none()
 
     token = Token(
         name=f"voucher-{code[:8]}",
         quota_usd=voucher.amount_usd,
         expires_at=key_expires_at,
-        group_id=default_group.id if default_group else None,
+        group_id=group.id if group else None,
     )
     session.add(token)
 
@@ -644,7 +653,8 @@ async def redeem_voucher_anonymously(
 
     logger.info(
         f"匿名兑卡 code={code[:4]}*** -> token={token.id[:8]} "
-        f"quota=${voucher.amount_usd} duration_days={voucher.duration_days}"
+        f"quota=${voucher.amount_usd} duration_days={voucher.duration_days} "
+        f"group={group.name if group else None}"
     )
     return {
         "key": token.key,
@@ -652,6 +662,7 @@ async def redeem_voucher_anonymously(
         "quota_usd": voucher.amount_usd,
         "duration_days": voucher.duration_days,
         "expires_at": key_expires_at,
+        "group": group.name if group else None,
     }
 
 
@@ -801,7 +812,8 @@ async function redeem() {
     const quota = data.quota_usd === 0 ? '无限额度' : '额度 $' + data.quota_usd;
     document.getElementById('meta').textContent =
       quota +
-      (data.expires_at ? ' · 有效期至 ' + data.expires_at.slice(0, 10) : ' · 无时间限制');
+      (data.expires_at ? ' · 有效期至 ' + data.expires_at.slice(0, 10) : ' · 无时间限制') +
+      (data.group ? ' · 分组 ' + data.group : '');
     res.classList.add('show');
   } catch (e) {
     err.textContent = '网络错误，请重试';
@@ -2142,6 +2154,14 @@ async def create_voucher(
     """批量创建消费券，code 自动生成，count=1 时返回单条记录，count>1 时返回 list。"""
     count = max(1, body.count)
     voucher_data = body.model_dump(exclude={"count"})
+    if voucher_data.get("group_id"):
+        group = (
+            await session.execute(
+                select(UserGroup).where(UserGroup.id == voucher_data["group_id"])
+            )
+        ).scalar_one_or_none()
+        if group is None:
+            raise HTTPException(status_code=400, detail="指定的用户组不存在")
     vouchers = [Voucher(**voucher_data) for _ in range(count)]
     for v in vouchers:
         session.add(v)
@@ -2181,3 +2201,25 @@ async def list_vouchers(
         "page": page,
         "items_per_page": items_per_page,
     }
+
+
+class VoucherBatchDeleteRequest(BaseModel):
+    ids: list[str]
+
+
+@voucher_router.post(
+    "/admin/vouchers/batch-delete",
+    tags=["Admin: Vouchers"],
+    summary="批量删除消费券",
+)
+async def batch_delete_vouchers(
+    body: VoucherBatchDeleteRequest,
+    session: AsyncSession = Depends(async_session_generator),
+    _: None = Depends(require_admin_access),
+) -> dict:
+    """按 id 列表批量硬删除消费券（含已使用的），返回实际删除数量。"""
+    if not body.ids:
+        return {"deleted": 0}
+    result = await session.execute(delete(Voucher).where(Voucher.id.in_(body.ids)))
+    await session.commit()
+    return {"deleted": result.rowcount}

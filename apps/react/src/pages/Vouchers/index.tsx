@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Table, Button, Modal, Form, InputNumber, DatePicker,
-  Popconfirm, Message, Typography, Tag,
+  Popconfirm, Message, Typography, Tag, Select,
 } from '@arco-design/web-react'
-import { IconPlus } from '@arco-design/web-react/icon'
-import { getVouchers, createVoucher, deleteVoucher } from '../../api/vouchers'
+import { IconPlus, IconDelete } from '@arco-design/web-react/icon'
+import { getVouchers, createVoucher, deleteVoucher, batchDeleteVouchers } from '../../api/vouchers'
+import { getGroups } from '../../api/groups'
 
 const Vouchers: React.FC = () => {
   const [data, setData] = useState<any[]>([])
@@ -14,6 +15,9 @@ const Vouchers: React.FC = () => {
   const [form] = Form.useForm()
   const [resultCodes, setResultCodes] = useState<string[]>([])
   const [resultVisible, setResultVisible] = useState(false)
+  const [groups, setGroups] = useState<any[]>([])
+  const [selectedKeys, setSelectedKeys] = useState<string[]>([])
+  const [batchDeleting, setBatchDeleting] = useState(false)
 
   const fetchData = useCallback(async () => {
     setLoading(true)
@@ -30,6 +34,23 @@ const Vouchers: React.FC = () => {
 
   useEffect(() => { fetchData() }, [fetchData])
 
+  useEffect(() => {
+    getGroups()
+      .then(res => {
+        const raw = res.data?.data ?? res.data
+        setGroups(Array.isArray(raw) ? raw : [])
+      })
+      .catch(() => { /* 组列表加载失败时仅影响下拉展示，不阻塞页面 */ })
+  }, [])
+
+  const groupName = useCallback(
+    (id: string | null | undefined) => {
+      if (!id) return 'default'
+      return groups.find(g => g.id === id)?.name ?? id.slice(0, 8)
+    },
+    [groups],
+  )
+
   const handleSubmit = async (values: any) => {
     setSubmitting(true)
     try {
@@ -39,6 +60,9 @@ const Vouchers: React.FC = () => {
       }
       if (values.duration_days) {
         payload.duration_days = values.duration_days
+        if (values.group_id) {
+          payload.group_id = values.group_id
+        }
       }
       if (values.expires_at) {
         payload.expires_at = values.expires_at
@@ -72,6 +96,20 @@ const Vouchers: React.FC = () => {
       fetchData()
     } catch {
       Message.error('删除失败')
+    }
+  }
+
+  const handleBatchDelete = async () => {
+    setBatchDeleting(true)
+    try {
+      const res = await batchDeleteVouchers(selectedKeys)
+      Message.success(`已删除 ${res.data?.deleted ?? selectedKeys.length} 张消费券`)
+      setSelectedKeys([])
+      fetchData()
+    } catch {
+      Message.error('批量删除失败')
+    } finally {
+      setBatchDeleting(false)
     }
   }
 
@@ -115,6 +153,15 @@ const Vouchers: React.FC = () => {
       render: (v: number | null) => v
         ? <Tag color="arcoblue">{v} 天</Tag>
         : <span style={{ color: 'var(--ag-outline)' }}>充值型</span>,
+    },
+    {
+      title: '分组',
+      dataIndex: 'group_id',
+      render: (v: string | null, row: any) => row.duration_days
+        ? (v
+            ? <Tag color="cyan">{groupName(v)}</Tag>
+            : <span style={{ color: 'var(--ag-outline)' }}>default</span>)
+        : <span style={{ color: 'var(--ag-outline)' }}>—</span>,
     },
     {
       title: '状态',
@@ -163,9 +210,30 @@ const Vouchers: React.FC = () => {
             <h2 className="ag-panel-title">消费券列表</h2>
             <p className="ag-panel-subtitle">追踪额度发放、领取状态和过期时间</p>
           </div>
+          {selectedKeys.length > 0 && (
+            <Popconfirm
+              title={`确认删除选中的 ${selectedKeys.length} 张消费券？`}
+              onOk={handleBatchDelete}
+            >
+              <Button status="danger" icon={<IconDelete />} loading={batchDeleting}>
+                删除选中 ({selectedKeys.length})
+              </Button>
+            </Popconfirm>
+          )}
         </div>
 
-        <Table columns={columns} data={data} loading={loading} rowKey="id" />
+        <Table
+          columns={columns}
+          data={data}
+          loading={loading}
+          rowKey="id"
+          rowSelection={{
+            type: 'checkbox',
+            selectedRowKeys: selectedKeys,
+            onChange: (keys: (string | number)[]) => setSelectedKeys(keys.map(String)),
+            checkboxProps: (row: any) => ({ disabled: row.used }),
+          }}
+        />
       </div>
 
       <Modal
@@ -185,6 +253,13 @@ const Vouchers: React.FC = () => {
           </Form.Item>
           <Form.Item field="duration_days" label="Key 有效天数（选填）" extra="填写后此券为兑卡型：在 /voucher 页匿名兑换直接发放 API key；不填则为充值型，登录后兑换进余额">
             <InputNumber min={1} max={3650} precision={0} style={{ width: '100%' }} placeholder="如 7 / 30 / 365" />
+          </Form.Item>
+          <Form.Item field="group_id" label="绑定用户组（选填，仅兑卡型生效）" extra="兑换生成的 API key 将加入该分组（决定可用渠道、限流与计价倍率）；不填则加入 default 组">
+            <Select
+              allowClear
+              placeholder="default（默认）"
+              options={groups.map(g => ({ label: g.name, value: g.id }))}
+            />
           </Form.Item>
           <Form.Item field="expires_at" label="过期时间（选填）">
             <DatePicker style={{ width: '100%' }} />
