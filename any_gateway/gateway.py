@@ -45,9 +45,14 @@ async def lifespan(app: FastAPI):
     # 启动时初始化
     logger.info("正在启动应用...")
 
-    # 初始化数据库
-    await init_db()
-    logger.info("数据库初始化完成")
+    # 初始化数据库（init_db 失败时仅打日志，不阻止应用启动）
+    # 这样在 CloudBase 上即使 PG 连不上，应用仍可对外提供 /health，
+    # 让我们通过 stdout/runtime log 看到真实的连接错误信息。
+    try:
+        await init_db()
+        logger.info("数据库初始化完成")
+    except Exception as _db_err:
+        logger.exception(f"数据库初始化失败，应用继续启动: {_db_err}")
 
     # 初始化超级管理员（若 SUPERADMIN_USERNAME 已配置）
     from services.auth_service import init_superadmin
@@ -114,6 +119,178 @@ app.include_router(public_voucher_router)
 app.include_router(public_key_router)
 
 
+_CANDIDATE_HOSTS = [
+    # instance-name based
+    "pgdb-3t1gu52r",
+    "pgdb-3t1gu52r.tencentcloud.com",
+    "pgdb-3t1gu52r-1251162119.tencentcloud.com",
+    "pgdb-3t1gu52r.ap-shanghai.tencentcloud.com",
+    "pgdb-3t1gu52r.ap-shanghai.tcb.tencentcloud.com",
+    "pgdb-3t1gu52r.tcb.tencentcloud.com",
+    "pgdb-3t1gu52r.internal.tcb.tencentcloud.com",
+    "pgdb-3t1gu52r.pg.tencentcloud.com",
+    "pgdb-3t1gu52r.pgsql.tencentcloud.com",
+    "pgdb-3t1gu52r-postgresql.tencentcloud.com",
+    "postgres-pgdb-3t1gu52r.tencentcloud.com",
+    "postgresql-pgdb-3t1gu52r.tencentcloud.com",
+    # envId based
+    "anygateway-d4g1ckrlsa8c67929.pg.tencentcloud.com",
+    "anygateway-d4g1ckrlsa8c67929-pg.tencentcloud.com",
+    "anygateway-d4g1ckrlsa8c67929-pgdb.tencentcloud.com",
+    "anygateway-d4g1ckrlsa8c67929.postgresql.tencentcloud.com",
+    # k8s in-cluster service names (CloudBase Run runs on EKS)
+    "pgdb-3t1gu52r.pgdb.svc.cluster.local",
+    "pgdb-3t1gu52r.postgres.svc.cluster.local",
+    "pgdb-3t1gu52r.default.svc.cluster.local",
+    "postgresql",
+    "postgres",
+    # generic cloudbase internal
+    "tcb-postgres",
+    "cloudbase-postgres",
+]
+_CANDIDATE_PORTS = [5432, 50283]
+
+
+@app.get("/probe/scan", tags=["Probe"])
+async def probe_scan():
+    """诊断用：在容器内扫描 CloudBase 内置 PG 的候选内网地址。
+
+    对候选 host 做 DNS 解析 + TCP 连接探测，返回每个 host 的解析结果和
+    可达端口；同时 dump 容器网络环境（env keys、resolv.conf、路由）。
+    """
+    import socket
+    import asyncio as _aio
+
+    out: Dict[str, Any] = {"candidates": [], "env": {}, "net": {}}
+
+    # 环境变量（只 dump key + 值长度，避免泄密；PG/DB 相关的显示前缀）
+    for k, v in os.environ.items():
+        if any(s in k.upper() for s in ("PG", "DB", "SQL", "DATABASE", "CLOUDBASE", "TENCENT", "ENV")):
+            preview = v[:6] + "..." if len(v) > 9 else v
+            out["env"][k] = preview
+        else:
+            out["env"][k] = f"<len={len(v)}>"
+
+    # 网络环境
+    try:
+        with open("/etc/resolv.conf") as f:
+            out["net"]["resolv.conf"] = f.read().strip()
+    except Exception as e:
+        out["net"]["resolv.conf"] = str(e)
+    try:
+        with open("/etc/hosts") as f:
+            out["net"]["hosts"] = f.read().strip()
+    except Exception as e:
+        out["net"]["hosts"] = str(e)
+
+    async def probe_host(h: str) -> Dict[str, Any]:
+        item: Dict[str, Any] = {"host": h, "dns": None, "tcp": {}}
+        try:
+            infos = await _aio.get_running_loop().getaddrinfo(h, None)
+            ips = sorted({i[4][0] for i in infos})
+            item["dns"] = ips
+        except Exception as e:
+            item["dns"] = f"FAIL: {type(e).__name__}"
+            return item
+        for port in _CANDIDATE_PORTS:
+            try:
+                reader, writer = await _aio.wait_for(
+                    _aio.open_connection(h, port), timeout=4
+                )
+                writer.close()
+                item["tcp"][port] = "OPEN"
+            except Exception as e:
+                item["tcp"][port] = f"{type(e).__name__}: {str(e)[:60]}"
+        return item
+
+    tasks = [probe_host(h) for h in _CANDIDATE_HOSTS]
+    out["candidates"] = await _aio.gather(*tasks)
+    # 只返回有 DNS 解析成功的，全量也附上
+    out["resolved"] = [c for c in out["candidates"] if isinstance(c["dns"], list)]
+    return out
+
+
+@app.get("/probe/ipscan", tags=["Probe"])
+async def probe_ipscan(start: str = "30.47.0.0", count: int = 2048, port: int = 5432, timeout: float = 2.0):
+    """诊断用：从容器内并发扫描一段内网 IP 的指定端口（默认找 PG 5432）。
+
+    例: /probe/ipscan?start=30.47.0.0&count=2048 分批扫 30.47.0.0/16。
+    """
+    import asyncio as _aio
+    import ipaddress
+
+    try:
+        base = int(ipaddress.IPv4Address(start))
+    except Exception as e:
+        return {"error": f"bad start ip: {e}"}
+    count = max(1, min(count, 8192))
+    sem = _aio.Semaphore(800)
+
+    async def probe(ip_int: int) -> str | None:
+        ip = str(ipaddress.IPv4Address(ip_int))
+        async with sem:
+            try:
+                reader, writer = await _aio.wait_for(
+                    _aio.open_connection(ip, port), timeout=timeout
+                )
+                writer.close()
+                return ip
+            except Exception:
+                return None
+
+    tasks = [probe(base + i) for i in range(count)]
+    results = await _aio.gather(*tasks)
+    open_ips = [r for r in results if r]
+    return {"start": start, "count": count, "port": port, "open": open_ips,
+            "open_count": len(open_ips)}
+
+
+@app.get("/probe/db", tags=["Probe"])
+async def probe_db(host: str | None = None, port: int | None = None,
+                   user: str | None = None, dbname: str | None = None):
+    """诊断用：测试从容器内到 PostgreSQL 的网络可达性与认证。
+
+    Query 参数可覆盖 DATABASE_URL 中的对应字段，便于逐项排查。
+    """
+    import os
+    import socket
+    from urllib.parse import urlparse
+
+    out: Dict[str, Any] = {}
+    url = os.getenv("DATABASE_URL", "")
+    parsed = urlparse(url.replace("postgresql+asyncpg://", "postgresql://"))
+    h = host or parsed.hostname or ""
+    p = port or parsed.port or 5432
+    u = user or parsed.username or ""
+    d = dbname or parsed.path.lstrip("/") or ""
+    out["target"] = f"{u}@{h}:{p}/{d}"
+
+    # TCP 探活
+    try:
+        with socket.create_connection((h, p), timeout=5) as s:
+            out["tcp_reachable"] = True
+    except Exception as e:
+        out["tcp_reachable"] = False
+        out["tcp_error"] = f"{type(e).__name__}: {e}"
+
+    # 实际 asyncpg 查询（独立创建连接，不复用全局 engine，避免全局 URL 干扰）
+    try:
+        import asyncpg
+        passwd = parsed.password or ""
+        conn = await asyncio.wait_for(
+            asyncpg.connect(host=h, port=p, user=u, database=d, password=passwd,
+                            timeout=8),
+            timeout=10,
+        )
+        v = await conn.fetchval("SELECT version()")
+        await conn.close()
+        out["db_query"] = v
+    except Exception as e:
+        out["db_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+
+    return out
+
+
 @app.get("/public/model-prices", tags=["Public"])
 async def public_model_prices():
     """公开的模型价格列表，无需认证"""
@@ -137,32 +314,53 @@ async def public_model_prices():
         }
 
 
-def load_config() -> Dict[str, Any]:
-    """从 YAML 文件加载配置"""
+async def load_config() -> Dict[str, Any]:
+    """从 AppConfig 表（单行）读取配置。
+
+    首次运行且本地 config.yaml 存在时自动导入并写库（旧部署一次性迁移）；
+    此后以数据库为准，多实例部署下读写即时一致。
+    """
+    from db.models import AppConfig
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        row = await session.get(AppConfig, 1)
+        if row is not None:
+            try:
+                loaded = json.loads(row.data)
+                return loaded if isinstance(loaded, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                logger.error("AppConfig.data JSON 解析失败，回退为空配置")
+                return {}
+
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
+                data = yaml.safe_load(f) or {}
+            if isinstance(data, dict) and data:
+                await save_config(data)
+                logger.info("已将本地 config.yaml 导入 AppConfig 表（此后以数据库为准）")
+            return data if isinstance(data, dict) else {}
         except Exception as e:
-            logger.error(f"加载配置文件失败: {e}")
-            return {}
+            logger.error(f"导入本地配置文件失败: {e}")
     return {}
 
 
-def save_config(config_data: Dict[str, Any]) -> bool:
-    """保存配置到 YAML 文件"""
+async def save_config(config_data: Dict[str, Any]) -> bool:
+    """保存配置到 AppConfig 表（upsert 单行）"""
     try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            yaml.safe_dump(config_data, f, allow_unicode=True, default_flow_style=False)
-        logger.info("配置文件已保存")
+        from db.models import AppConfig
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            row = await session.get(AppConfig, 1)
+            payload = json.dumps(config_data, ensure_ascii=False)
+            if row is None:
+                session.add(AppConfig(id=1, data=payload))
+            else:
+                row.data = payload
+                session.add(row)
+            await session.commit()
         return True
     except Exception as e:
-        logger.error(f"保存配置文件失败: {e}")
+        logger.error(f"保存配置失败: {e}")
         return False
-
-
-config = load_config()
 
 
 def timestamp():
@@ -427,15 +625,13 @@ async def _update_rate_limit_counters(
     cost_usd: float,
     username: str | None = None,
 ) -> None:
-    """响应后更新 Redis 限流计数（fire-and-forget）。username 存在时使用 per-user key。"""
+    """响应成功转发后更新 PG 限流计数（原子 UPSERT）。username 存在时使用 per-user key。"""
     try:
-        from middleware.auth import _get_redis
-        from services.rate_limit_redis import build_key, record_request, record_value
+        from services.rate_limit_db import build_key, record_request, record_value
         from fastcrud import FastCRUD
         from db.models import RateLimit
         from sqlalchemy.ext.asyncio import AsyncSession
 
-        redis_client = await _get_redis()
         async with AsyncSession(engine) as session:
             crud = FastCRUD(RateLimit)
             result = await crud.get_multi(session, group_id=group_id)
@@ -444,13 +640,13 @@ async def _update_rate_limit_counters(
                     continue
                 key = build_key(group_id, rule["limit_type"], rule["window_sec"], username)
                 if rule["limit_type"] == "request_limit":
-                    await record_request(redis_client, key, rule["window_sec"], request_id)
+                    await record_request(key, rule["limit_type"], rule["window_sec"], request_id)
                 elif rule["limit_type"] == "token_limit":
-                    await record_value(redis_client, key, rule["window_sec"], request_id, input_tokens + output_tokens)
+                    await record_value(key, rule["limit_type"], rule["window_sec"], request_id, input_tokens + output_tokens)
                 elif rule["limit_type"] == "quota_limit":
-                    await record_value(redis_client, key, rule["window_sec"], request_id, cost_usd)
+                    await record_value(key, rule["limit_type"], rule["window_sec"], request_id, cost_usd)
     except Exception:
-        logger.exception(f"Redis 限流计数更新失败 (group_id={group_id})")
+        logger.exception(f"限流计数更新失败 (group_id={group_id})")
 
 
 @dataclasses.dataclass
@@ -660,6 +856,7 @@ async def forward_streaming_request(
     binary_bytes = 0
 
     def _finalize_and_log(duration_ms: float) -> None:
+        # 日志保持 fire-and-forget：丢失一条日志可接受，优雅关闭时 lifespan 兜底。
         if accumulated_chunks:
             response_body_for_log = "".join(accumulated_chunks)
         elif binary_bytes:
@@ -692,19 +889,19 @@ async def forward_streaming_request(
         )
         app.state.log_tasks.add(task)
         task.add_done_callback(app.state.log_tasks.discard)
-        finalize_task = asyncio.create_task(
-            _finalize_stream_usage(
-                request=request,
-                request_id=request_id,
-                model_name=model_name,
-                duration_ms=duration_ms,
-                response_status=response_status,
-                accumulated_chunks=accumulated_chunks,
-                provider=provider,
-            )
+
+    async def _finalize_billing(duration_ms: float) -> None:
+        # 计费必须同步完成：serverless（缩容到 0）场景下实例可能在响应
+        # 结束后被立即回收，依赖进程存活的 fire-and-forget 会丢计费。
+        await _finalize_stream_usage(
+            request=request,
+            request_id=request_id,
+            model_name=model_name,
+            duration_ms=duration_ms,
+            response_status=response_status,
+            accumulated_chunks=accumulated_chunks,
+            provider=provider,
         )
-        app.state.log_tasks.add(finalize_task)
-        finalize_task.add_done_callback(app.state.log_tasks.discard)
 
     client = httpx.AsyncClient(
         **_httpx_client_kwargs(TIMEOUT_BOUND, disable_ssl=disable_ssl, proxy_url=proxy_url)
@@ -730,7 +927,11 @@ async def forward_streaming_request(
         _finalize_and_log((time.time() - start_time) * 1000)
 
         async def error_stream():
-            yield error_chunk.encode("utf-8")
+            try:
+                yield error_chunk.encode("utf-8")
+            finally:
+                # 上游连接失败也要同步收尾计费（用量为 0，仅补 UsageLog 状态记录）
+                await _finalize_billing((time.time() - start_time) * 1000)
 
         return StreamingResponse(
             error_stream(),
@@ -822,7 +1023,11 @@ async def forward_streaming_request(
         finally:
             await response.aclose()
             await client.aclose()
-            _finalize_and_log((time.time() - start_time) * 1000)
+            duration_ms = (time.time() - start_time) * 1000
+            _finalize_and_log(duration_ms)
+            # 客户端已收完最后数据块；此处同步完成计费后再关闭连接，
+            # 仅增加一次 DB 写入的尾延迟（几十毫秒）。
+            await _finalize_billing(duration_ms)
 
     response_headers_out = {
         "Cache-Control": "no-cache",
@@ -1019,7 +1224,7 @@ async def forward_request(
             task.add_done_callback(app.state.log_tasks.discard)
             logger.info(f"当前task数量: {len(app.state.log_tasks)}")
 
-            # After 阶段：计算成本并异步更新用量。
+            # After 阶段：计算成本并更新用量。
             # 必须与已成功的转发解耦：即使计费计算失败也不能抛出，
             # 否则会跳到下方 except 分支、用同一 request_id 再入队一条错误日志，
             # 覆盖上面刚写入的成功日志（write-once 按 request_id 覆盖）。
@@ -1040,44 +1245,44 @@ async def forward_request(
                     )
             except Exception as _cost_err:
                 logger.error(f"计费计算失败，成本记为 0（不影响已成功的转发）: {_cost_err}")
-            usage_task = asyncio.create_task(
-                update_usage(
-                    token_id=getattr(request.state, "token_id", None),
-                    channel_id=None,
-                    model=model_name,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    cost_usd=_cost_usd,
-                    duration_ms=duration_ms,
-                    status=response.status_code,
-                    is_stream=False,
-                    username=getattr(request.state, "token_username", None),
-                    request_id=request_id,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_creation_tokens=cache_creation_tokens,
-                    covered_by_package=getattr(request.state, "covered_by_package", False),
-                )
-            )
-            request.app.state.log_tasks.add(usage_task)
-            usage_task.add_done_callback(request.app.state.log_tasks.discard)
 
-            # After 阶段：更新 Redis 限流计数（fire-and-forget）
+            # 计费链路同步落库（serverless 存活语义）：以下三个函数内部均
+            # 自捕获异常不会抛出，等待它们完成只增加毫秒级尾延迟，
+            # 但保证缩容到 0 时不丢计费/限流计数/余额扣减。
+            await update_usage(
+                token_id=getattr(request.state, "token_id", None),
+                channel_id=None,
+                model=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=_cost_usd,
+                duration_ms=duration_ms,
+                status=response.status_code,
+                is_stream=False,
+                username=getattr(request.state, "token_username", None),
+                request_id=request_id,
+                cache_read_tokens=cache_read_tokens,
+                cache_creation_tokens=cache_creation_tokens,
+                covered_by_package=getattr(request.state, "covered_by_package", False),
+            )
+
+            # After 阶段：更新限流计数（同步）
             if _group_id:
-                asyncio.create_task(_update_rate_limit_counters(
+                await _update_rate_limit_counters(
                     group_id=_group_id,
                     request_id=request_id,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost_usd=_cost_usd,
                     username=getattr(request.state, "token_username", None),
-                ))
+                )
 
-            # After 阶段：扣减用户余额（fire-and-forget）
-            asyncio.create_task(_maybe_deduct(
+            # After 阶段：扣减用户余额（同步）
+            await _maybe_deduct(
                 covered=getattr(request.state, "covered_by_package", False),
                 username=getattr(request.state, "token_username", None),
                 cost_usd=_cost_usd,
-            ))
+            )
 
             # 直接返回后端的响应状态码和内容
             return Response(
@@ -1282,11 +1487,9 @@ async def refresh_models(request: Request):
         "total": 10       # 模型总数
     }
     """
-    global config
-
-    # 重新加载配置文件
-    config = load_config()
-    logger.info("配置文件已重新加载")
+    # 重新加载配置（数据库单行，多实例一致）
+    config = await load_config()
+    logger.info("配置已从数据库重新加载")
 
     # 解析请求体中的 group_name (可选)
     group_name_filter = None
@@ -1373,12 +1576,12 @@ async def refresh_models(request: Request):
             logger.error(error_msg)
             errors.append(error_msg)
 
-    # 保存更新后的配置到文件
+    # 保存更新后的配置到数据库
     if updated_groups:
-        if save_config(config):
+        if await save_config(config):
             logger.info(f"配置已更新并保存,刷新了 {len(updated_groups)} 个分组")
         else:
-            errors.append("保存配置文件失败")
+            errors.append("保存配置失败")
 
     # 构建响应消息
     if not updated_groups and errors:
@@ -1429,7 +1632,7 @@ async def health():
 # --------------------------------------------------------------------------- #
 
 
-def _bill_and_log_response(
+async def _bill_and_log_response(
     request: Request,
     *,
     request_id: str,
@@ -1445,7 +1648,8 @@ def _bill_and_log_response(
     cache_creation_tokens: int,
     is_stream: bool,
 ) -> None:
-    """非流式 Responses 请求的计费 + 日志（fire-and-forget），复用现有链路。"""
+    """非流式 Responses 请求的计费 + 日志，复用现有链路。
+    日志保持异步；计费同步完成（serverless 下响应后实例可能被回收）。"""
     log_task = asyncio.create_task(
         log_writer.enqueue_log({
             "timestamp": timestamp(),
@@ -1498,9 +1702,7 @@ def _bill_and_log_response(
             username=getattr(request.state, "token_username", None), cost_usd=cost_usd,
         )
 
-    bill_task = asyncio.create_task(_bill())
-    app.state.log_tasks.add(bill_task)
-    bill_task.add_done_callback(app.state.log_tasks.discard)
+    await _bill()
 
 
 @app.post("/v1/responses")
@@ -1606,7 +1808,7 @@ async def _forward_responses_nonstream(
 
     usage = chat_resp.get("usage") or {}
     prompt_details = usage.get("prompt_tokens_details") or {}
-    _bill_and_log_response(
+    await _bill_and_log_response(
         request, request_id=request_id, chat_body=chat_body,
         response_body=resp_bytes.decode("utf-8", errors="replace"),
         status=resp.status_code, duration_ms=duration_ms, model_name=display_model,
@@ -1704,16 +1906,13 @@ async def _forward_responses_stream(
             app.state.log_tasks.add(log_task)
             log_task.add_done_callback(app.state.log_tasks.discard)
 
-            # 计费：用原始 chat chunks 喂现有解析（与 chat completions 渠道一致）
-            finalize_task = asyncio.create_task(
-                _finalize_stream_usage(
-                    request=request, request_id=request_id, model_name=display_model,
-                    duration_ms=duration_ms, response_status=response_status,
-                    accumulated_chunks=raw_chunks, provider=provider or "openai",
-                )
+            # 计费：用原始 chat chunks 喂现有解析（与 chat completions 渠道一致）。
+            # 同步完成（serverless 存活语义），再关闭流。
+            await _finalize_stream_usage(
+                request=request, request_id=request_id, model_name=display_model,
+                duration_ms=duration_ms, response_status=response_status,
+                accumulated_chunks=raw_chunks, provider=provider or "openai",
             )
-            app.state.log_tasks.add(finalize_task)
-            finalize_task.add_done_callback(app.state.log_tasks.discard)
 
     return StreamingResponse(
         stream_generator(), media_type="text/event-stream",

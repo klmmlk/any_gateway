@@ -7,12 +7,25 @@ services:
     volumes:
       - ./mock/mock_ad_server:/app
 
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
+  # 本地联调 MySQL（模拟生产 TDSQL-C MySQL serverless）：docker compose --profile mysql up
+  mysql:
+    image: mysql:8
+    profiles: ["mysql"]
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      - MYSQL_ROOT_PASSWORD=gateway
+      - MYSQL_USER=gateway
+      - MYSQL_PASSWORD=gateway
+      - MYSQL_DATABASE=gateway
+    ports:
+      - "3307:3306"
     volumes:
-      - redis_data:/data
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pgateway" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   gateway:
     container_name: any-gateway
@@ -29,10 +42,16 @@ services:
       - ADMIN_FALLBACK_KEY=${ADMIN_FALLBACK_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - SUPERADMIN_USERNAME=${SUPERADMIN_USERNAME:-superadmin}
-      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      # 生产（腾讯云）：mysql+aiomysql://...（TDSQL-C MySQL serverless）；
+      # 不设置则回退本地 sqlite（./data/gateway.db）
+      - DATABASE_URL=${DATABASE_URL:-}
+      # 审计日志后端：local（默认，写 ./data/sessions）| cos（对象存储）
+      - LOG_STORAGE_BACKEND=${LOG_STORAGE_BACKEND:-local}
+      - COS_REGION=${COS_REGION:-}
+      - COS_BUCKET=${COS_BUCKET:-}
+      - COS_SECRET_ID=${COS_SECRET_ID:-}
+      - COS_SECRET_KEY=${COS_SECRET_KEY:-}
       - SKIP_SSL_VERIFY=${SKIP_SSL_VERIFY:-0}
-    depends_on:
-      - redis
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:${GATEWAY_PORT:-8003}/health" ]
@@ -42,4 +61,4 @@ services:
       retries: 3
 
 volumes:
-  redis_data:
+  mysql_data:

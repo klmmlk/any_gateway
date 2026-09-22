@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,20 +14,6 @@ from starlette.requests import Request
 from db.database import engine
 from db.models import Token, User
 from log_writer import enqueue_rejection_log
-
-# 导出供测试 patch
-from services.rate_limit_redis import get_window_count, get_window_sum  # noqa: F401
-
-_redis_client = None
-
-
-async def _get_redis():
-    global _redis_client
-    if _redis_client is None:
-        import redis.asyncio as aioredis
-        url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        _redis_client = aioredis.from_url(url, decode_responses=True)
-    return _redis_client
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -122,13 +107,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         username = token.get("username")
 
         if group_id:
-            # Type 1：套餐规则检查
+            # Type 1：套餐规则检查（限流状态在主库，见 services.rate_limit_db）
             try:
                 from services.rate_limit_service import check_rate_limits
-                redis_client = await _get_redis()
                 async with AsyncSession(engine, expire_on_commit=False) as session:
                     passed, error_msg = await check_rate_limits(
-                        group_id, redis_client, session, username=username
+                        group_id, session, username=username
                     )
                 if passed:
                     request.state.covered_by_package = True  # 有 group 且通过 → 套餐内

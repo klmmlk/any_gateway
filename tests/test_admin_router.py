@@ -1465,9 +1465,7 @@ def test_rate_limit_error_message_format():
             await session.commit()
 
             with patch("services.rate_limit_service.get_window_count", return_value=10):
-                from unittest.mock import AsyncMock
-                mock_redis = AsyncMock()
-                passed, msg = await check_rate_limits(gid, mock_redis, session)
+                passed, msg = await check_rate_limits(gid, session)
                 assert passed is False
                 assert msg is not None
                 assert "10" in msg

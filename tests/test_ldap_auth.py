@@ -22,14 +22,10 @@ if str(_AG_PATH) not in sys.path:
 # ---------------------------------------------------------------------------
 
 def _reload_ldap_auth(env_vars: dict):
-    """在给定环境变量下重新加载 services.ldap_auth 模块，返回模块对象。"""
-    # 先移除已缓存的模块，强制重新执行模块级代码
-    to_remove = [
-        key for key in sys.modules
-        if key == "services" or key.startswith("services.")
-    ]
-    for key in to_remove:
-        del sys.modules[key]
+    """在给定环境变量下重新加载 services.ldap_auth 模块，返回模块对象。
+    只移除 ldap_auth 自身：清空全部 services.* 会连带驱逐其他模块，
+    导致后续测试文件持有的函数引用与 sys.modules 中的新实例不一致。"""
+    sys.modules.pop("services.ldap_auth", None)
 
     with patch.dict(os.environ, env_vars, clear=False):
         import services.ldap_auth as m  # noqa: PLC0415

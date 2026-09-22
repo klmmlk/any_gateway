@@ -3,7 +3,9 @@ pydantic
 fastapi
 python-multipart
 aiofiles
+aiomysql
 aiosqlite
+asyncpg
 httpx
 brotli
 ldap3
@@ -12,7 +14,7 @@ fastcrud
 uvicorn
 pyyaml
 python-jose[cryptography]
-redis
+cos-python-sdk-v5
 
 # streamlit
 # st_copy

@@ -39,3 +39,11 @@ mock/mock_ad_server/users.yaml
 
 docs/refs/
 tts_*
+
+# 云托管临时部署目录（含 .deploy.env 密钥）
+deploy_src/
+
+# CloudBase CLI 本地配置（按机器生成）
+cloudbaserc.json
+.agents/
+skills-lock.json

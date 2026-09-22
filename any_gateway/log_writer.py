@@ -29,6 +29,51 @@ _compress_executor = ThreadPoolExecutor(
 )
 
 
+# ==================== 存储后端（local | cos） ====================
+# serverless / 多实例部署用 COS 对象存储（无本地盘、实例销毁不丢日志）；
+# 本地开发与测试默认 local（写 ./data/sessions）。对象名 sessions/{date}/{id}.json.br
+# 与本地相对路径一致，读回逻辑两种后端统一。
+LOG_STORAGE_BACKEND = os.getenv("LOG_STORAGE_BACKEND", "local").lower()
+
+_cos_client = None
+
+
+def _use_cos() -> bool:
+    return LOG_STORAGE_BACKEND == "cos"
+
+
+def _get_cos_client():
+    global _cos_client
+    if _cos_client is None:
+        from qcloud_cos import CosConfig, CosS3Client
+        _cos_client = CosS3Client(CosConfig(
+            Region=os.getenv("COS_REGION", ""),
+            SecretId=os.getenv("COS_SECRET_ID", ""),
+            SecretKey=os.getenv("COS_SECRET_KEY", ""),
+            Token=os.getenv("COS_TOKEN") or None,
+        ))
+    return _cos_client
+
+
+def _cos_bucket() -> str:
+    return os.getenv("COS_BUCKET", "")
+
+
+def _cos_object_key(date_str: str, request_id: str) -> str:
+    return f"sessions/{date_str}/{request_id}.json.br"
+
+
+def _cos_put(key: str, data: bytes) -> None:
+    """同步上传（调用方用 asyncio.to_thread 包装）。"""
+    _get_cos_client().put_object(Bucket=_cos_bucket(), Body=data, Key=key)
+
+
+def _cos_get(key: str) -> bytes:
+    """同步下载对象内容（调用方用 to_thread / run_in_executor 包装）。"""
+    resp = _get_cos_client().get_object(Bucket=_cos_bucket(), Key=key)
+    return resp["Body"].get_raw_stream().read()
+
+
 # ==================== 路径与日期工具 ====================
 
 def parse_date_str(timestamp: str) -> str:
@@ -69,7 +114,7 @@ def _compress(data: bytes, quality: int) -> bytes:
 
 async def write_log(path: Path, log_data: dict, quality: int = COMPRESS_QUALITY):
     """
-    将一条日志写入 brotli 压缩的 JSON 文件。
+    将一条日志写入 brotli 压缩的 JSON 文件（本地后端直写，测试亦直接使用）。
     Write-once：每个 request_id 对应一个文件，不追加，不加锁。
     quality: brotli 压缩等级，高负载时可传 COMPRESS_QUALITY_FAST 换取更快落盘。
     """
@@ -82,6 +127,22 @@ async def write_log(path: Path, log_data: dict, quality: int = COMPRESS_QUALITY)
     logger.debug(f"日志已写入: {path}")
 
 
+async def write_log_to_backend(date_str: str, request_id: str, log_data: dict, quality: int = COMPRESS_QUALITY):
+    """按 LOG_STORAGE_BACKEND 写入：local 落本地盘；cos 压缩后上传对象存储。"""
+    loop = asyncio.get_running_loop()
+    raw = json.dumps(log_data, ensure_ascii=False).encode("utf-8")
+    compressed = await loop.run_in_executor(_compress_executor, _compress, raw, quality)
+    if _use_cos():
+        await asyncio.to_thread(_cos_put, _cos_object_key(date_str, request_id), compressed)
+        logger.debug(f"日志已上传 COS: {request_id}")
+    else:
+        path = get_request_log_path(request_id, date_str)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        async with aiofiles.open(path, "wb") as f:
+            await f.write(compressed)
+        logger.debug(f"日志已写入: {path}")
+
+
 def read_log(path: Path) -> dict:
     """
     读取并解压一个请求日志文件，返回 dict。
@@ -89,6 +150,27 @@ def read_log(path: Path) -> dict:
     """
     raw = _read_compressed(path)
     return json.loads(raw)
+
+
+def read_log_sync(date_str: str, request_id: str) -> dict:
+    """按存储后端读取单条请求日志并解压（local 文件 / COS 对象）。
+
+    不存在时抛 FileNotFoundError；同步函数，供端点通过 run_in_executor 调用。
+    """
+    if _use_cos():
+        try:
+            raw = _cos_get(_cos_object_key(date_str, request_id))
+        except Exception as exc:
+            from qcloud_cos.cos_exceptions import CosServiceError
+            if isinstance(exc, CosServiceError) and exc.get_status_code() == 404:
+                raise FileNotFoundError(f"COS 对象不存在: {request_id}") from exc
+            raise
+        return json.loads(brotli.decompress(raw))
+
+    path = get_request_log_path(request_id, date_str)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    return read_log(path)
 
 
 def load_day_logs(date_dir: Path) -> list:
@@ -141,7 +223,7 @@ async def _write_one(log_data: Dict[str, Any]) -> None:
     # 高负载时降低压缩等级，优先更快落盘
     quality = COMPRESS_QUALITY if _inflight < _HIGH_WATER else COMPRESS_QUALITY_FAST
     try:
-        await write_log(get_request_log_path(request_id, date_str), log_data, quality=quality)
+        await write_log_to_backend(date_str, request_id, log_data, quality=quality)
     except Exception as e:
         logger.error(
             f"写入日志文件失败(该条日志丢失): request_id={request_id} "

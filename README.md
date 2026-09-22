@@ -15,7 +15,7 @@ A self-hosted AI API gateway that proxies requests to multiple backend providers
 - **User group access control** — Assign users to groups with priority-based channel access
 - **API key management** — Issue `sk-*` keys with per-key quota limits, expiration, and freeze/unfreeze
 - **Quota enforcement** — Per-token USD spend limits enforced before forwarding requests
-- **Rate limiting** — Redis-based sliding window limits on requests, tokens, or spend per group
+- **Rate limiting** — DB-backed fixed-window limits on requests, tokens, or spend per group (multi-instance safe, no Redis required)
 - **Pricing & billing** — Per-model pricing with per-group multipliers and custom override prices
 - **Vouchers** — Redeem codes to top up user quota balances
 - **LDAP/AD authentication** — Enterprise login via Active Directory Simple Bind
@@ -38,9 +38,9 @@ The backend uses **SQLModel**, combining SQLAlchemy's database capabilities with
 - **Authentication:** LDAP/AD integration via **ldap3** plugs directly into existing Active Directory infrastructure — no user re-registration required.
 - **Permission model:** JWT-based RBAC via **python-jose** with clear separation between `user`, `admin`, and `superadmin` roles.
 
-### 4. Dual-mode Rate Limiting (Redis + Balance)
-- **Group tokens:** Redis sliding-window limits on request count, token count, or spend per configurable time window.
-- **Personal tokens:** Simple balance check against `User.quota_usd`. Fail-open when Redis is unavailable.
+### 4. Dual-mode Rate Limiting (DB Counter + Balance)
+- **Group tokens:** Fixed-window counters (request count / token count / spend per window) stored in the main DB via atomic UPSERT — safe for multi-instance and serverless deployments, no Redis required.
+- **Personal tokens:** Simple balance check against `User.quota_usd`. Fail-open on DB errors.
 
 ### 5. Frontend State and Performance (React 19 + Zustand + Arco Design)
 Built with **React 19**, **Vite**, **Arco Design** UI components, and **Zustand** for lightweight global state management.
@@ -68,7 +68,7 @@ any_gateway/
     ├── ldap_auth.py         # LDAP Simple Bind + emergency fallback key
     ├── quota.py             # Quota check and usage update
     ├── pricing.py           # Cost calculation (group-custom → global fallback × multiplier)
-    ├── rate_limit_redis.py  # Redis sliding-window rate limiting (Lua atomic ops)
+    ├── rate_limit_db.py     # DB fixed-window rate limiting (atomic UPSERT)
     └── rate_limit_service.py # Rate limit decision entry point
 
 apps/react/src/
@@ -110,16 +110,16 @@ Two modes depending on token type:
 
 | Token type | Method | Dimensions |
 |---|---|---|
-| Group token (has `group_id`) | Redis sliding window | requests / tokens / spend per window |
+| Group token (has `group_id`) | DB fixed-window counter | requests / tokens / spend per window |
 | Personal token (no `group_id`) | Balance check | `User.quota_usd` remaining |
 
-Rate limit rules are configured per group via `/admin/rate-limits`. Redis is optional — missing Redis causes fail-open behavior.
+Rate limit rules are configured per group via `/admin/rate-limits`. Counters live in the main database (table `rate_limit_counters`, atomic UPSERT, multi-instance safe); DB errors cause fail-open behavior.
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - Node.js 18+ (for frontend development)
-- Redis (optional, for rate limiting)
+- MySQL 8 (production, TDSQL-C serverless) / PostgreSQL (also supported) / SQLite (local dev, default)
 - LDAP/AD server (or use the mock server for local development)
 
 ## Quick Start
@@ -152,10 +152,11 @@ LDAP_SERVER_URL=ldap://dc.company.internal
 LDAP_BASE_DN=DC=company,DC=internal
 LDAP_DOMAIN=COMPANY
 JWT_EXPIRE_HOURS=24
-DATABASE_URL=sqlite+aiosqlite:///./data/gateway.db  # default
-REDIS_URL=redis://localhost:6379                     # for rate limiting
+DATABASE_URL=sqlite+aiosqlite:///./data/gateway.db  # default; use mysql+aiomysql://... in production (TDSQL-C)
 GATEWAY_PORT=8003
-NUM_LOG_CONSUMERS=3
+# Audit log storage: local (default, ./data/sessions) | cos (Tencent COS, for serverless/multi-instance)
+LOG_STORAGE_BACKEND=local
+COS_REGION= / COS_BUCKET= / COS_SECRET_ID= / COS_SECRET_KEY=
 ```
 
 ### 3. Run
@@ -172,6 +173,9 @@ The admin dashboard is served at `http://localhost:8003`.
 # With mock LDAP server
 docker-compose up
 
+# Gateway + MySQL 8 (production-like, simulates TDSQL-C MySQL serverless)
+docker compose --profile mysql up
+
 # Gateway only
 docker build -t any_gateway .
 docker run -p 8003:8003 \
@@ -181,6 +185,29 @@ docker run -p 8003:8003 \
   -v $(pwd)/data:/app/data \
   any_gateway
 ```
+
+## Tencent Cloud Serverless Deployment (scale-to-zero)
+
+The gateway is serverless-ready: no local state (DB / rate limiting / config all externalized), billing finalized synchronously before responses complete, audit logs shipped to COS. Idle compute cost is zero.
+
+**Stack**: 云托管 CloudBase Run (container, scale to 0, native SSE) + TDSQL-C **MySQL 8.0** Serverless (auto-pause) + COS (audit logs). No Redis — rate limiting runs in MySQL (atomic `ON DUPLICATE KEY UPDATE` upserts).
+
+> TDSQL-C purchase notes: character set `utf8mb4` (required), collation default `utf8mb4_0900_ai_ci` is fine; enable auto-pause and enable public network access temporarily for data migration, then disable it.
+
+1. **Database**: create a TDSQL-C MySQL Serverless cluster (same region/VPC as CloudBase Run); migrate existing data:
+   ```bash
+   # 建表（幂等 DDL）
+   DATABASE_URL='mysql+aiomysql://root:pass@外网地址:端口/gateway' python -c "import sys; sys.path.insert(0,'any_gateway'); import asyncio; from db.database import init_db; asyncio.run(init_db())"
+   # 迁移数据（可重跑；PostgreSQL 目标同样支持）
+   DATABASE_URL='mysql+aiomysql://root:pass@外网地址:端口/gateway' python scripts/migrate_db.py
+   ```
+2. **COS**: create a bucket for audit logs (optional lifecycle rule, e.g. 90d → infrequent access).
+3. **云托管**: import the Docker image, listen on port 8003, min instances 0, graceful shutdown ≥ 30s, same VPC as the DB; enable public egress for upstream LLM APIs / LDAP.
+4. **Environment**: `DATABASE_URL`, `LOG_STORAGE_BACKEND=cos`, `COS_REGION/COS_BUCKET/COS_SECRET_ID/COS_SECRET_KEY`, plus the usual `ADMIN_KEY` etc.
+5. **Post-deploy checklist** (must verify on first deploy):
+   - SSE long-stream timeout of the 云托管 gateway (raise platform-side or set min instances = 1 if it cuts long streams)
+   - cold-start latency with DB auto-pause wake-up (container 2-5s + DB 1-2s)
+   - billing survives instance scale-to-zero (UsageLog / balance / rate-limit counters must not lose rows)
 
 ## Frontend Development
 
@@ -281,10 +308,10 @@ Tests use SQLite in-memory databases and FastAPI's `TestClient`.
 |---|---|
 | Backend framework | FastAPI |
 | Database ORM | SQLModel + FastCRUD |
-| Database | SQLite (default) / PostgreSQL |
+| Database | SQLite (default) / MySQL (TDSQL-C) / PostgreSQL |
 | Authentication | ldap3, python-jose |
-| Rate limiting | Redis + Lua scripts |
-| Audit logging | brotli + asyncio queue |
+| Rate limiting | DB fixed-window counters (atomic UPSERT) |
+| Audit logging | brotli + local files / Tencent COS |
 | HTTP client | httpx |
 | Frontend | React 19 + TypeScript + Vite |
 | UI components | Arco Design |

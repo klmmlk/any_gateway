@@ -53,7 +53,7 @@ from db.models import (
     VoucherCreate,
     VoucherUpdate,
 )
-from log_writer import get_request_log_path, read_log, parse_date_str
+from log_writer import read_log_sync, parse_date_str
 from services.auth_service import require_auth, require_role, verify_token
 
 # ---------------------------------------------------------------------------
@@ -222,11 +222,9 @@ async def get_my_status(
     user: dict = Depends(require_auth),
     session: AsyncSession = Depends(async_session_generator),
 ) -> dict:
-    import os
-    import redis.asyncio as aioredis
     from db.models import User, UserGroup, RateLimit
     from services.auth_service import get_visible_groups
-    from services.rate_limit_redis import build_key, get_window_count, get_window_sum
+    from services.rate_limit_db import build_key, get_window_count, get_window_sum
 
     username = user["username"]
 
@@ -246,15 +244,7 @@ async def get_my_status(
     else:
         groups = await get_visible_groups(username, session)
 
-    # 3. 尝试连接 Redis（不可用时 fail open）
-    redis_client = None
-    try:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        redis_client = aioredis.from_url(redis_url, decode_responses=True)
-    except Exception:
-        pass
-
-    # 4. 构建每个分组的限流状态
+    # 3. 构建每个分组的限流状态（读主库固定窗口计数，异常时 fail open 返回 0）
     crud_rl = FastCRUD(RateLimit)
     groups_status = []
     for group in groups:
@@ -267,16 +257,12 @@ async def get_my_status(
             key = build_key(group.id, rule["limit_type"], rule["window_sec"], username)
             try:
                 if rule["limit_type"] == "request_limit":
-                    current = (
-                        await get_window_count(redis_client, key, rule["window_sec"])
-                        if redis_client
-                        else 0
+                    current = await get_window_count(
+                        key, rule["limit_type"], rule["window_sec"]
                     )
                 else:
-                    current = (
-                        await get_window_sum(redis_client, key, rule["window_sec"])
-                        if redis_client
-                        else 0
+                    current = await get_window_sum(
+                        key, rule["limit_type"], rule["window_sec"]
                     )
             except Exception:
                 current = 0
@@ -1178,8 +1164,8 @@ async def fetch_channel_models(
 
 async def _get_request_messages(request_id: str, session: AsyncSession) -> dict:
     """
-    根据 request_id 从 DB 查 created_at，推导文件路径，读取消息内容。
-    DB 记录或文件不存在时抛出 HTTPException。
+    根据 request_id 从 DB 查 created_at，按存储后端（本地盘 / COS）读取消息内容。
+    DB 记录或日志对象/文件不存在时抛出 HTTPException。
     """
     result = await session.execute(select(UsageLog).where(UsageLog.id == request_id))
     log = result.scalar_one_or_none()
@@ -1187,12 +1173,11 @@ async def _get_request_messages(request_id: str, session: AsyncSession) -> dict:
         raise HTTPException(status_code=404, detail="日志记录不存在")
 
     date_str = parse_date_str(log.created_at)
-    path = get_request_log_path(request_id, date_str)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="消息文件不存在")
-
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, read_log, path)
+    try:
+        data = await loop.run_in_executor(None, read_log_sync, date_str, request_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="消息文件不存在")
     return data
 
 
