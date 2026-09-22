@@ -39,3 +39,10 @@ mock/mock_ad_server/users.yaml
 
 docs/refs/
 tts_*
+
+.agents/
+skills-lock.json
+cloudbaserc.json
+
+# 云托管部署目录（含密钥）
+deploy_src/

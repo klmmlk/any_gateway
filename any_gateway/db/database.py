@@ -9,21 +9,34 @@ from sqlmodel import SQLModel, select
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/gateway.db")
 
-if "sqlite" in DATABASE_URL:
-    _db_path = DATABASE_URL.split("///")[-1]
-    Path(_db_path).parent.mkdir(parents=True, exist_ok=True)
+# CloudBase ExecutePGSql 后端：不连 PG TCP，SDK 直连 TCB OpenAPI。
+if DATABASE_URL.startswith("execsql+cloudbase:"):
+    from db.exec_sql_backend import ExecSqlEngine
+    engine = ExecSqlEngine()  # type: ignore[assignment]
 
-engine_kwargs = {
-    "echo": False,
-    "connect_args": {"check_same_thread": False},
-}
+    # 让业务代码 `AsyncSession(engine)` 拿到 ExecSession。
+    # 本模块（db.database）先于各业务模块被 import，业务模块随后
+    # `from sqlalchemy.ext.asyncio import AsyncSession` 时取到的是补丁后的类。
+    import sqlalchemy.ext.asyncio as _sa_async
+    from db.exec_session import ExecSession
 
-# StaticPool 适合内存 SQLite；文件型 SQLite 复用单一异步连接时，
-# 请求取消后容易把后续请求共用的连接一并终止。
-if DATABASE_URL.endswith(":memory:"):
-    engine_kwargs["poolclass"] = StaticPool
+    _sa_async.AsyncSession = ExecSession  # type: ignore[assignment]
+else:
+    if "sqlite" in DATABASE_URL:
+        _db_path = DATABASE_URL.split("///")[-1]
+        Path(_db_path).parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_async_engine(DATABASE_URL, **engine_kwargs)
+    engine_kwargs = {
+        "echo": False,
+        "connect_args": {"check_same_thread": False},
+    }
+
+    # StaticPool 适合内存 SQLite；文件型 SQLite 复用单一异步连接时，
+    # 请求取消后容易把后续请求共用的连接一并终止。
+    if DATABASE_URL.endswith(":memory:"):
+        engine_kwargs["poolclass"] = StaticPool
+
+    engine = create_async_engine(DATABASE_URL, **engine_kwargs)
 
 
 async def async_session_generator() -> AsyncGenerator[AsyncSession, None]:
