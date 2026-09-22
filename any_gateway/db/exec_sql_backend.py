@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.engine.interfaces import DBAPIConnection
 from sqlalchemy.exc import OperationalError, ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from loguru import logger
 
@@ -88,6 +88,56 @@ async def _exec_sql(sql: str) -> Tuple[List[str], List[List[str]], int]:
 # ---------------------------------------------------------------------
 
 
+class _RowsView:
+    """Result 视图代理：可迭代，带 first()/all()/scalars()（FastCRUD 等依赖）。"""
+
+    def __init__(self, rows: List[Dict[str, Any]], columns: List[str]):
+        self._rows = rows
+        self._columns = columns
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def all(self):
+        return list(self._rows)
+
+    def scalars(self):
+        return _ScalarView(self._rows, self._columns)
+
+
+class _ScalarView:
+    """Result.scalars() 代理：迭代标量，带 first()/all()。"""
+
+    def __init__(self, rows: List[Dict[str, Any]], columns: List[str]):
+        self._rows = rows
+        self._columns = columns
+
+    def __iter__(self):
+        return (r[self._columns[0]] if self._columns else None for r in self._rows)
+
+    def __len__(self):
+        return len(self._rows)
+
+    def first(self):
+        return (self._rows[0] or {}).get(self._columns[0]) if self._rows else None
+
+    def all(self):
+        return list(self) if self._columns else []
+
+
+class _MappingsView(_RowsView):
+    """Result.mappings() 代理（FastCRUD 依赖）。"""
+
+    def __init__(self, rows: List[Dict[str, Any]], columns: List[str]):
+        super().__init__(rows, columns)
+
+
 class ExecSqlResult:
     """AsyncSession.execute() 的返回值代理，最小实现。"""
 
@@ -114,7 +164,14 @@ class ExecSqlResult:
         return out
 
     def scalars(self):
-        return iter([row[self._columns[0]] if self._columns else None for row in self._row_tuples])
+        # ORM 实体查询时返回整行 dict（近似 ORM 实体），否则返回第一列标量
+        if getattr(self, "_orm_mode", False):
+            return _RowsView(self._row_tuples, self._columns)
+        return _ScalarView(self._row_tuples, self._columns)
+
+    def mappings(self):
+        """返回 MappingView 行（FastCRUD 依赖）。"""
+        return _MappingsView(self._row_tuples, self._columns)
 
     def all(self):
         return self._row_tuples
@@ -149,7 +206,7 @@ class ExecSqlConnection(AsyncConnection):
         # init_db 用 run_sync(create_all) 拿 metadata 跑 DDL；这里我们直接转发 metadata 给 SDK
         from sqlmodel import SQLModel
 
-        if fn is SQLModel.metadata.create_all:
+        if getattr(fn, "__name__", "") == "create_all":
             # 把 metadata.tables 转成 CREATE TABLE IF NOT EXISTS 拼起来
             stmts = [_create_table_ddl(t) for t in SQLModel.metadata.sorted_tables]
             for s in stmts:
@@ -170,12 +227,24 @@ class ExecSqlConnection(AsyncConnection):
         return None
 
 
-class ExecSqlEngine(AsyncEngine):
-    """占位 AsyncEngine：业务侧只用到 .begin() 和 AsyncConnection.execute()。"""
+class _FakeDialect:
+    """最小方言占位：让 init_db 等判断 engine.dialect.name 的代码正常工作。"""
+
+    name = "postgresql"
+
+
+class _FakeSyncEngine:
+    """AsyncEngine.dialect property 取 self.sync_engine.dialect；给它一个假对象。"""
+
+    dialect = _FakeDialect()
+
+
+class ExecSqlEngine:
+    """鸭子类型 AsyncEngine：业务侧只用到 .begin()、.dialect.name、.connect()。"""
 
     def __init__(self):
-        # 跳过父类 __init__，手动维护
-        self.sync_engine = None
+        self.sync_engine = _FakeSyncEngine()
+        self.dialect = _FakeDialect()
 
     @asynccontextmanager
     async def begin(self):

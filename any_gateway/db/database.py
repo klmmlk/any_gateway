@@ -21,6 +21,7 @@ if DATABASE_URL.startswith("execsql+cloudbase:"):
     from db.exec_session import ExecSession
 
     _sa_async.AsyncSession = ExecSession  # type: ignore[assignment]
+    AsyncSession = ExecSession  # 本模块顶部 import 先于 patch 执行，这里覆盖局部引用
 else:
     if "sqlite" in DATABASE_URL:
         _db_path = DATABASE_URL.split("///")[-1]

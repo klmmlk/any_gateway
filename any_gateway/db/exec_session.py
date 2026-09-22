@@ -81,8 +81,16 @@ class ExecSession:
     # ---- 入口 ----
     async def execute(self, statement, params: Optional[Dict[str, Any]] = None, **kw):
         sql = compile_sql(statement, params)
-        # 整体发送（多语句时 ExecutePGSql 同连接执行，BEGIN..COMMIT 保持事务性）
-        return await self._conn.execute(sa_text(sql))
+        res = await self._conn.execute(sa_text(sql))
+        # ORM 实体查询（select(Model)）：scalars() 应返回整行 dict 而非第一列标量
+        is_orm = False
+        try:
+            descs = getattr(statement, "column_descriptions", None)
+            is_orm = bool(descs and descs[0].get("entity") is not None)
+        except Exception:
+            is_orm = False
+        res._orm_mode = is_orm
+        return res
 
     async def get(self, model, ident, **kw):
         pk_cols = list(model.__table__.primary_key.columns.keys())
