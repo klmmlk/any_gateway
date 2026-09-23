@@ -196,6 +196,80 @@ def test_calculate_cost_request_unit():
     assert abs(result - 0.006) < 1e-9
 
 
+def test_calculate_cost_audio_second_unit():
+    """audio_second 单位：按音频时长（秒）计费，与 token 互斥。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="qwen-asr", unit="audio_second", price_per_unit=0.001))
+            await session.commit()
+            # 12.5 秒 * 0.001 USD/秒 = 0.0125 USD
+            return await calculate_cost(
+                session, None, "qwen-asr",
+                input_tokens=0, output_tokens=0,
+                audio_seconds=12.5,
+            )
+
+    result = asyncio.run(run())
+    assert abs(result - 0.0125) < 1e-9
+
+
+def test_calculate_cost_audio_second_with_multiplier():
+    """audio_second 单价乘 group multiplier。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="qwen-asr", unit="audio_second", price_per_unit=0.001))
+            await session.commit()
+            # 10 秒 * 0.001 * 2.0 multiplier = 0.02
+            return await calculate_cost(
+                session, None, "qwen-asr",
+                input_tokens=0, output_tokens=0,
+                multiplier=2.0,
+                audio_seconds=10.0,
+            )
+
+    result = asyncio.run(run())
+    assert abs(result - 0.02) < 1e-9
+
+
+def test_calculate_cost_audio_zero_falls_back_to_token():
+    """audio_seconds=0 时不查 audio_second 单价，走 token 公式。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="gpt-4", unit="input_token", price_per_unit=10.0))
+            session.add(ModelPrice(model_name="gpt-4", unit="output_token", price_per_unit=30.0))
+            await session.commit()
+            return await calculate_cost(
+                session, None, "gpt-4",
+                input_tokens=1_000_000, output_tokens=500_000,
+                audio_seconds=0.0,
+            )
+
+    # 1M * 10 + 0.5M * 30 = 10 + 15 = 25
+    result = asyncio.run(run())
+    assert abs(result - 25.0) < 1e-9
+
+
 # ── Task 3 tests ──────────────────────────────────────────────────────────────
 
 ADMIN_HEADERS = {"x-admin-key": "test-admin-secret"}

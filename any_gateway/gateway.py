@@ -1,5 +1,5 @@
 from fastapi.responses import Response, JSONResponse, StreamingResponse, FileResponse
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, col
 from services.quota import check_quota, update_usage, update_user_balance
 from services.pricing import calculate_cost
+from services.ws_forwarder import forward_ws_session
 from services.responses_converter import (
     responses_to_chat_request,
     chat_resp_to_responses_resp,
@@ -242,6 +243,11 @@ async def find_backend_for_model(
             "proxy_url": channel.proxy_url,
             "disable_ssl": bool(channel.disable_ssl),
             "disable_compression": bool(channel.disable_compression),
+            "channel_id": channel.id,
+            # WebSocket 上游相关字段：protocol=="wss" 时启用 ws↔wss 转发
+            "protocol": (channel.protocol or "http").lower(),
+            "ws_path": channel.ws_path,
+            "ws_subprotocols": channel.ws_subprotocols,
         }
 
     def _weighted_choice(channels: list) -> Optional[Channel]:
@@ -451,6 +457,81 @@ async def _update_rate_limit_counters(
                     await record_value(redis_client, key, rule["window_sec"], request_id, cost_usd)
     except Exception:
         logger.exception(f"Redis 限流计数更新失败 (group_id={group_id})")
+
+
+async def _resolve_token_for_ws(api_key: str) -> dict | None:
+    """WS 端点专用鉴权：复用 AuthMiddleware 的 _validate_key 逻辑，返回 token 字典或 None。
+
+    不注入 request.state（WS 无 request 对象），直接返回 token dict 给调用方。
+    """
+    from middleware.auth import AuthMiddleware
+
+    token, error_msg, _status = await AuthMiddleware._validate_key(api_key)
+    if token is None:
+        logger.debug(f"WS 鉴权失败: {error_msg}")
+        return None
+    return token
+
+
+async def _finalize_asr_usage(
+    *,
+    request_id: str,
+    token: dict,
+    model: str,
+    audio_seconds: float,
+    wall_duration_seconds: float,
+    channel_id: str | None = None,
+    status: int = 200,
+) -> None:
+    """ASR WebSocket 收尾：计费 + UsageLog 落库（fire-and-forget）。
+
+    与 _finalize_stream_usage 镜像：调 calculate_cost（按 audio_seconds 维度）、
+    update_usage（写入 audio_seconds 字段），最后扣余额。
+    所有失败仅记录日志，不影响客户端（连接已关闭）。
+    """
+    group_id = token.get("group_id")
+    username = token.get("username")
+    multiplier = await _get_group_multiplier(group_id)
+
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as pricing_session:
+            cost_usd = await calculate_cost(
+                session=pricing_session,
+                group_id=group_id,
+                model=model,
+                input_tokens=0,
+                output_tokens=0,
+                multiplier=multiplier,
+                audio_seconds=audio_seconds,
+            )
+    except Exception:
+        logger.exception(f"ASR 计费失败 (request_id={request_id})")
+        return
+
+    try:
+        await update_usage(
+            token_id=token.get("id"),
+            channel_id=channel_id,
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=cost_usd,
+            duration_ms=wall_duration_seconds * 1000.0,
+            status=status,
+            is_stream=True,
+            username=username,
+            request_id=request_id,
+            covered_by_package=False,  # WS 端点当前未走套餐检查
+            audio_seconds=audio_seconds,
+        )
+    except Exception:
+        logger.exception(f"ASR usage 落库失败 (request_id={request_id})")
+
+    # 扣减余额（fire-and-forget）
+    try:
+        await _maybe_deduct(covered=False, username=username, cost_usd=cost_usd)
+    except Exception:
+        logger.exception(f"ASR 余额扣减失败 (request_id={request_id})")
 
 
 @dataclasses.dataclass
@@ -1720,6 +1801,134 @@ async def _forward_responses_stream(
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},
     )
+
+
+# =======================
+# WebSocket 端点：实时 ASR 中转
+# =======================
+# 客户端 URL 形式：
+#   wss://gateway.example.com/v1/audio/asr/stream
+#     ?model=qwen-audio-3.0-asr-flash-streaming
+#     &api_key=sk-xxx
+#
+# 协议：网关不解析 DashScope 二进制帧，客户端按 dashscope 协议自行组包后发到网关 ws 端点，
+# 网关字节级透传到上游 wss；上游返回的识别结果字节级透传给客户端。
+# 第一帧约定：若客户端第一个文本消息是 JSON 且包含 audio_duration_seconds 字段，
+# 网关读取作为计费基准；否则按 WS 连接墙钟时长兜底。
+#
+# 错误关闭码：
+#   1008 - 鉴权失败 / 配额超限 / 模型未找到
+#   1011 - 上游连接失败
+#   1013 - 暂时性错误
+@app.websocket("/v1/audio/asr/stream")
+async def ws_audio_asr_stream(websocket: WebSocket):
+    """实时 ASR WebSocket 端点。"""
+    # 1. 早 accept，便于发 close code
+    await websocket.accept()
+
+    # 2. 鉴权（query api_key），与 HTTP 端点的 sk-* key 格式保持一致
+    api_key = (websocket.query_params.get("api_key") or "").strip()
+    if not api_key.startswith("sk-"):
+        await websocket.close(code=1008, reason="invalid api key")
+        return
+
+    token = await _resolve_token_for_ws(api_key)
+    if not token:
+        await websocket.close(code=1008, reason="unauthorized")
+        return
+
+    # 3. 配额检查（仅 Type 2 账户余额；Type 1 套餐检查依赖 Request 对象，WS 端点暂不接入）
+    username = token.get("username")
+    used_usd = token.get("used_usd", 0)
+    quota_usd = token.get("quota_usd", 0)
+    if not check_quota(quota_usd, used_usd):
+        await websocket.close(code=1008, reason="quota exceeded")
+        return
+
+    # 4. 找渠道（按 ?model= 路由）
+    model = (websocket.query_params.get("model") or "").strip()
+    if not model:
+        await websocket.close(code=1008, reason="missing model")
+        return
+
+    backend = await find_backend_for_model(
+        model, username=username, group_id=token.get("group_id")
+    )
+    if not backend or backend.get("protocol") != "wss":
+        await websocket.close(code=1008, reason="no wss backend")
+        return
+
+    # 5. 拼 wss URL：base_url https:// → wss://，拼上 ws_path
+    base = (backend["base_url"] or "").rstrip("/")
+    if base.startswith("https://"):
+        base = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        base = "ws://" + base[len("http://"):]
+    ws_path = (backend.get("ws_path") or "/api-ws/v1/inference").lstrip("/")
+    upstream_url = f"{base}/{ws_path}"
+
+    # 6. meta 钩子（计费） + 子协议解析
+    meta: dict = {}
+
+    async def on_meta(payload: dict) -> None:
+        meta.update(payload)
+
+    subprotocols: list[str] | None = None
+    raw_subs = backend.get("ws_subprotocols")
+    if raw_subs:
+        try:
+            subprotocols = json.loads(raw_subs)
+            if not isinstance(subprotocols, list):
+                subprotocols = None
+        except (ValueError, TypeError):
+            subprotocols = None
+
+    # 7. 启 forwarder，跑双 pump
+    request_id = uuid4().hex
+    status_code = 200
+    duration_seconds = 0.0
+    try:
+        result = await forward_ws_session(
+            client_ws=websocket,
+            upstream_url=upstream_url,
+            api_key=backend["api_key"],
+            proxy_url=backend.get("proxy_url"),
+            disable_ssl=backend.get("disable_ssl", False),
+            subprotocols=subprotocols,
+            on_meta=on_meta,
+        )
+        duration_seconds = float(result.get("duration_seconds") or 0.0)
+    except WebSocketDisconnect:
+        # 客户端主动断开，视为正常关闭
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"ASR WS 会话异常 (request_id={request_id}, model={model}): {exc!r}"
+        )
+        status_code = 1011
+        try:
+            await websocket.close(code=1011, reason="upstream error")
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        # 8. 收尾：按 audio_seconds 计费
+        declared_audio = meta.get("audio_duration_seconds")
+        try:
+            declared_audio_f = float(declared_audio) if declared_audio is not None else 0.0
+        except (TypeError, ValueError):
+            declared_audio_f = 0.0
+        # 客户端未声明 audio_duration_seconds 时，按 WS 墙钟时长兜底
+        billable_audio = declared_audio_f if declared_audio_f > 0 else duration_seconds
+        if billable_audio > 0:
+            await _finalize_asr_usage(
+                request_id=request_id,
+                token=token,
+                model=model,
+                audio_seconds=billable_audio,
+                wall_duration_seconds=duration_seconds,
+                channel_id=backend.get("channel_id"),
+                status=status_code,
+            )
 
 
 # 捕获所有 HTTP 方法的所有路径

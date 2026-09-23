@@ -17,6 +17,7 @@ import {
   Modal,
   Checkbox,
   Spin,
+  Radio,
 } from '@arco-design/web-react'
 import { IconPlus, IconDelete, IconRefresh, IconSettings, IconSearch } from '@arco-design/web-react/icon'
 import type { ColumnProps } from '@arco-design/web-react/es/Table'
@@ -36,12 +37,14 @@ const PROVIDER_COLORS: Record<string, string> = {
   openai: 'arcoblue',
   anthropic: 'purple',
   gemini: 'green',
+  'dashscope-asr': 'orange',
 }
 
 const PROVIDER_OPTIONS = [
   { label: 'OpenAI', value: 'openai' },
   { label: 'Anthropic', value: 'anthropic' },
   { label: 'Gemini', value: 'gemini' },
+  { label: 'DashScope ASR (wss)', value: 'dashscope-asr' },
 ]
 
 interface Mapping {
@@ -136,7 +139,14 @@ const Channels: React.FC = () => {
     setEditingChannel(null)
     setMappings([])
     form.resetFields()
-    form.setFieldsValue({ weight: 1, enabled: true, provider: 'openai', disable_ssl: false, disable_compression: false })
+    form.setFieldsValue({
+      weight: 1,
+      enabled: true,
+      provider: 'openai',
+      disable_ssl: false,
+      disable_compression: false,
+      protocol: 'http',
+    })
     setDrawerVisible(true)
   }
 
@@ -154,6 +164,9 @@ const Channels: React.FC = () => {
       proxy_url: channel.proxy_url ?? '',
       disable_ssl: channel.disable_ssl ?? false,
       disable_compression: channel.disable_compression ?? false,
+      protocol: channel.protocol ?? 'http',
+      ws_path: channel.ws_path ?? '',
+      ws_subprotocols: channel.ws_subprotocols ?? '',
     })
     setDrawerVisible(true)
   }
@@ -187,6 +200,11 @@ const Channels: React.FC = () => {
       // proxy_url 空串归一为 null（表示不配置渠道级代理）
       const proxy_url = (values.proxy_url || '').trim() || null
 
+      // WS 字段：仅在 protocol=wss 时携带；空串归一为 null
+      const protocol = values.protocol || 'http'
+      const ws_path = ((values.ws_path || '').trim() || null) as string | null
+      const ws_subprotocols = ((values.ws_subprotocols || '').trim() || null) as string | null
+
       if (editingChannel) {
         const payload: Record<string, unknown> = {
           name: values.name,
@@ -198,6 +216,9 @@ const Channels: React.FC = () => {
           proxy_url,
           disable_ssl: !!values.disable_ssl,
           disable_compression: !!values.disable_compression,
+          protocol,
+          ws_path,
+          ws_subprotocols,
         }
         // 仅当用户填写了新 API Key 才更新
         if (values.api_key) {
@@ -217,6 +238,9 @@ const Channels: React.FC = () => {
           proxy_url,
           disable_ssl: !!values.disable_ssl,
           disable_compression: !!values.disable_compression,
+          protocol,
+          ws_path,
+          ws_subprotocols,
         })
         Message.success('Channel 创建成功')
       }
@@ -724,6 +748,41 @@ const Channels: React.FC = () => {
               </FormItem>
             </Col>
           </Row>
+
+          <FormItem
+            label="上游协议"
+            field="protocol"
+            extra="wss 表示该渠道是 WebSocket 上游（用于 DashScope 实时 ASR 等场景）"
+          >
+            <Radio.Group>
+              <Radio value="http">HTTP</Radio>
+              <Radio value="wss">WSS（WebSocket）</Radio>
+            </Radio.Group>
+          </FormItem>
+
+          {/* WS-only fields：仅当 protocol=wss 时显示（Arco 函数 children 签名：(formData, form)） */}
+          <FormItem shouldUpdate={(prev, next) => prev.protocol !== next.protocol} noStyle>
+            {(formData) =>
+              formData?.protocol === 'wss' ? (
+                <>
+                  <FormItem
+                    label="WSS 路径"
+                    field="ws_path"
+                    extra="上游 WebSocket 路径，如 /api-ws/v1/inference（默认阿里 DashScope 实时 ASR 端点）"
+                  >
+                    <Input placeholder="/api-ws/v1/inference（可选，留空使用默认值）" allowClear />
+                  </FormItem>
+                  <FormItem
+                    label="WSS 子协议"
+                    field="ws_subprotocols"
+                    extra="可选，JSON 数组字符串，如 [&quot;binary&quot;]"
+                  >
+                    <Input placeholder='["binary"]（可选）' allowClear />
+                  </FormItem>
+                </>
+              ) : null
+            }
+          </FormItem>
 
           {/* model_mapping 编辑器 */}
           <div style={{ marginBottom: 8 }}>

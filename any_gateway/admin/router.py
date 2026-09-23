@@ -1115,6 +1115,14 @@ async def _fetch_upstream_models(channel: dict) -> list:
             f"Channel {channel.get('id')} 返回 {len(models)} 个模型，截断至 {MAX_MODELS}"
         )
         models = models[:MAX_MODELS]
+
+    # DashScope 实时 ASR 等 wss 渠道没有标准的 /v1/models 端点，
+    # 直接从本地白名单返回（前端按 OpenAI /models 响应格式渲染）。
+    provider = (channel.get("provider") or "").lower()
+    if provider == "dashscope-asr":
+        from services.asr_catalog import DASHSCOPE_ASR_MODELS
+        return DASHSCOPE_ASR_MODELS
+
     return models
 
 

@@ -13,6 +13,7 @@ uvicorn
 pyyaml
 python-jose[cryptography]
 redis
+websockets>=12.0
 
 # streamlit
 # st_copy

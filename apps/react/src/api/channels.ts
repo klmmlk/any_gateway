@@ -13,6 +13,12 @@ export interface Channel {
   proxy_url: string | null
   disable_ssl: boolean
   disable_compression: boolean
+  /** "http" | "wss"。wss 表示该渠道是 WebSocket 上游（用于实时 ASR 等场景）。 */
+  protocol?: string
+  /** wss 模式下上游 WS 路径，如 /api-ws/v1/inference */
+  ws_path?: string | null
+  /** wss 子协议，JSON 数组字符串，如 '["binary"]' */
+  ws_subprotocols?: string | null
   created_at: string
 }
 
@@ -28,6 +34,9 @@ export interface ChannelCreate {
   proxy_url?: string | null
   disable_ssl?: boolean
   disable_compression?: boolean
+  protocol?: string
+  ws_path?: string | null
+  ws_subprotocols?: string | null
 }
 
 export const getChannels = (params?: Record<string, unknown>) =>

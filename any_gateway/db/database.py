@@ -69,6 +69,29 @@ async def init_db():
         except Exception:
             pass
 
+    # channels 表的 WebSocket 上游相关字段（wss 协议渠道，幂等自动加列）
+    for col_name, col_type in [
+        ("protocol", "VARCHAR(16) DEFAULT 'http'"),
+        ("ws_path", "VARCHAR(512)"),
+        ("ws_subprotocols", "TEXT"),
+    ]:
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    f"ALTER TABLE channels ADD COLUMN {col_name} {col_type}"
+                ))
+        except Exception:
+            pass
+
+    # usage_logs 表加 audio_seconds（ASR 按音频时长计费，幂等自动加列）
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE usage_logs ADD COLUMN audio_seconds REAL DEFAULT 0"
+            ))
+    except Exception:
+        pass
+
     # vouchers 表的兑卡时长（匿名兑卡直接吐 key 的有效天数，幂等自动加列）
     async with engine.begin() as conn:
         try:

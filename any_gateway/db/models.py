@@ -98,6 +98,11 @@ class ChannelBase(SQLModel):
     disable_compression: bool = Field(
         default=False
     )  # 强制 accept-encoding=identity，兼容「压缩却不回传 Content-Encoding」的非标准上游
+    # 协议族：默认 http；wss 表示该渠道是 WebSocket 上游（用于实时 ASR 等场景）。
+    # 选择 wss 时，base_url 仍按 https:// 填，运行时按规则替换为 wss:// 并拼接 ws_path。
+    protocol: str = Field(default="http")  # "http" | "wss"
+    ws_path: str | None = None  # wss 模式下上游 WS 路径，如 /api-ws/v1/inference
+    ws_subprotocols: str | None = None  # wss 子协议，JSON 数组字符串，如 '["binary"]'
 
 
 class Channel(ChannelBase, table=True):
@@ -122,6 +127,9 @@ class ChannelUpdate(SQLModel):
     proxy_url: str | None = None
     disable_ssl: bool | None = None
     disable_compression: bool | None = None
+    protocol: str | None = None
+    ws_path: str | None = None
+    ws_subprotocols: str | None = None
 
 
 # =======================
@@ -145,6 +153,9 @@ class UsageLog(SQLModel, table=True):
     duration_ms: float = Field(default=0)
     status: int | None = None
     is_stream: bool = Field(default=False)
+    # 音频时长（秒），用于 ASR 类请求的按秒计费。
+    # 非 ASR 请求为 0。
+    audio_seconds: float = Field(default=0)
     created_at: str = Field(default_factory=utcnow)
 
 

@@ -27,6 +27,8 @@ interface ModelGroup {
   cache_write_token?: number
   extra_context_token?: number
   request?: number
+  /** ASR 类按音频时长（秒）计费的单价（USD/秒）。 */
+  audio_second?: number
   rows: PriceRow[]
 }
 
@@ -43,7 +45,7 @@ function groupByModel(data: PriceRow[]): ModelGroup[] {
     if (row.context_length) g.context_length = row.context_length
     if (row.stability) g.stability = row.stability
     const unit = row.unit as keyof ModelGroup
-    if (['input_token', 'output_token', 'cache_read_token', 'cache_write_token', 'extra_context_token', 'request'].includes(row.unit)) {
+    if (['input_token', 'output_token', 'cache_read_token', 'cache_write_token', 'extra_context_token', 'request', 'audio_second'].includes(row.unit)) {
       ;(g as any)[unit] = row.price_per_unit
     }
   }
@@ -109,6 +111,7 @@ const Prices: React.FC = () => {
         cache_write_price: group.cache_write_token,
         extra_context_price: group.extra_context_token,
         request_price: group.request,
+        audio_price: group.audio_second,
       })
     } else {
       setPriceMode('token')
@@ -133,12 +136,24 @@ const Prices: React.FC = () => {
           cache_write_token: values.cache_write_price,
           extra_context_token: values.extra_context_price,
           request: values.request_price,
+          audio_second: values.audio_price,
         }
 
         for (const row of editing.rows) {
           const newPrice = unitPriceMap[row.unit]
           await updatePrice(row.id, {
             price_per_unit: newPrice ?? row.price_per_unit,
+            ...meta,
+          })
+        }
+
+        // audio_second: 单独处理（独立 unit，可能还没创建过）
+        const existingAudioRow = editing.rows.find(r => r.unit === 'audio_second')
+        if (values.audio_price != null && values.audio_price > 0 && !existingAudioRow) {
+          await createPrice({
+            model_name: editing.model_name,
+            unit: 'audio_second',
+            price_per_unit: values.audio_price,
             ...meta,
           })
         }
@@ -165,31 +180,33 @@ const Prices: React.FC = () => {
 
         Message.success('已更新')
       } else {
+        const creates: Array<{ unit: string; price: number }> = []
         if (priceMode === 'request') {
-          await createPrice({
-            model_name: values.model_name,
-            unit: 'request',
-            price_per_unit: values.request_price,
-            ...meta,
-          })
+          creates.push({ unit: 'request', price: values.request_price })
         } else {
-          const creates = [
+          ;[
             { unit: 'input_token', price: values.input_price },
             { unit: 'output_token', price: values.output_price },
             { unit: 'cache_read_token', price: values.cache_read_price },
             { unit: 'cache_write_token', price: values.cache_write_price },
             { unit: 'extra_context_token', price: values.extra_context_price },
-          ].filter(c => c.price != null && c.price > 0)
-
-          await Promise.all(
-            creates.map(c => createPrice({
-              model_name: values.model_name,
-              unit: c.unit,
-              price_per_unit: c.price,
-              ...meta,
-            }))
-          )
+          ].forEach(c => {
+            if (c.price != null && c.price > 0) creates.push(c)
+          })
         }
+        // ASR 音频时长（秒）单价：与 priceMode 独立，无论 token / request 模式都可设置
+        if (values.audio_price != null && values.audio_price > 0) {
+          creates.push({ unit: 'audio_second', price: values.audio_price })
+        }
+
+        await Promise.all(
+          creates.map(c => createPrice({
+            model_name: values.model_name,
+            unit: c.unit,
+            price_per_unit: c.price,
+            ...meta,
+          }))
+        )
         Message.success('已创建')
       }
       setVisible(false)
@@ -251,6 +268,14 @@ const Prices: React.FC = () => {
       dataIndex: 'cache_write_token',
       width: 110,
       render: (v?: number) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{formatPrice(v)}</span>,
+    },
+    {
+      title: '音频秒 (USD/s)',
+      dataIndex: 'audio_second',
+      width: 130,
+      render: (v?: number) => v != null
+        ? <Tag color="orange"><span style={{ fontFamily: 'monospace' }}>${v.toFixed(4)}</span></Tag>
+        : <span style={{ color: '#c0c0c0' }}>-</span>,
     },
     {
       title: '稳定性',
@@ -395,6 +420,15 @@ const Prices: React.FC = () => {
               <InputNumber min={0} step={0.001} precision={6} style={{ width: '100%' }} />
             </Form.Item>
           )}
+
+          {/* ASR 音频时长（秒）单价：与 priceMode 独立，token / request 模式都可设置 */}
+          <Form.Item
+            field="audio_price"
+            label="音频秒单价 (USD/秒)"
+            extra="ASR 实时语音识别按音频时长计费；留空表示不启用按秒计费"
+          >
+            <InputNumber min={0} step={0.0001} precision={6} style={{ width: '100%' }} />
+          </Form.Item>
         </Form>
       </Modal>
     </div>
