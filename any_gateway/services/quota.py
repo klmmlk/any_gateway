@@ -10,7 +10,7 @@ import asyncio
 
 from sqlalchemy import case, update as sa_update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from db.database import AsyncSession
 from fastcrud import FastCRUD
 from loguru import logger
 

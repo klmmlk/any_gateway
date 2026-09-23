@@ -357,23 +357,23 @@ def test_type1_exceeded_type2_no_quota_returns_429(client):
 
 
 def test_redis_unavailable_fail_open(client):
-    """Redis 不可用（ConnectionError）→ fail open → 不是 429。"""
+    """限流后端不可用（DB 异常）→ fail open → 不是 429。"""
     username = "user_redis_fail"
     _run(_insert_user(username, quota_usd=50.0))
     group_id = _run(_insert_group("group_redis_fail"))
     _run(_insert_rate_limit(group_id, window_sec=60, limit_type="request_limit", value=1))
     key = _run(_insert_token("t7_redis_fail", username=username, group_id=group_id))
 
-    # mock 模块级 _get_redis 函数抛出 ConnectionError，触发 _check_limits 的 fail open
+    # mock 限流读数函数抛出连接异常，触发 _check_limits 的 fail open
     with patch(
-        "middleware.auth._get_redis",
+        "services.rate_limit_service.get_window_count",
         new_callable=AsyncMock,
-        side_effect=ConnectionError("Redis unreachable"),
+        side_effect=ConnectionError("rate limit backend unreachable"),
     ):
         resp = _post_chat(client, key)
 
     assert resp.status_code != 429, (
-        f"Redis fail open should not 429, got {resp.status_code}: {resp.text}"
+        f"rate limit fail open should not 429, got {resp.status_code}: {resp.text}"
     )
 
 
@@ -542,13 +542,8 @@ def test_multi_rule_disabled_rule_skipped(client):
     _run(_insert_rate_limit(group_id, window_sec=60, limit_type="request_limit", value=0))  # 禁用
     key = _run(_insert_token("t_disabled_rule", username=username, group_id=group_id))
 
-    # 不需要 mock，禁用规则直接跳过，不查 Redis
-    with patch(
-        "middleware.auth._get_redis",
-        new_callable=AsyncMock,
-        return_value=AsyncMock(),
-    ):
-        resp = _post_chat(client, key)
+    # 不需要 mock，禁用规则直接跳过，不查限流计数
+    resp = _post_chat(client, key)
 
     assert resp.status_code != 429, f"disabled rule should not 429, got {resp.status_code}"
 

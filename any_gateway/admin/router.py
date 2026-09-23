@@ -25,7 +25,7 @@ from jose import JWTError
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import asc, desc, delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from db.database import AsyncSession
 
 from db.database import async_session_generator
 from db.models import (
@@ -53,7 +53,7 @@ from db.models import (
     VoucherCreate,
     VoucherUpdate,
 )
-from log_writer import get_request_log_path, read_log, parse_date_str
+from log_writer import read_log_sync, parse_date_str
 from services.auth_service import require_auth, require_role, verify_token
 
 # ---------------------------------------------------------------------------
@@ -222,11 +222,9 @@ async def get_my_status(
     user: dict = Depends(require_auth),
     session: AsyncSession = Depends(async_session_generator),
 ) -> dict:
-    import os
-    import redis.asyncio as aioredis
     from db.models import User, UserGroup, RateLimit
     from services.auth_service import get_visible_groups
-    from services.rate_limit_redis import build_key, get_window_count, get_window_sum
+    from services.rate_limit_db import build_key, get_window_count, get_window_sum
 
     username = user["username"]
 
@@ -246,15 +244,7 @@ async def get_my_status(
     else:
         groups = await get_visible_groups(username, session)
 
-    # 3. 尝试连接 Redis（不可用时 fail open）
-    redis_client = None
-    try:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-        redis_client = aioredis.from_url(redis_url, decode_responses=True)
-    except Exception:
-        pass
-
-    # 4. 构建每个分组的限流状态
+    # 3. 构建每个分组的限流状态（限流计数在主库，get_window_* 内部 fail open）
     crud_rl = FastCRUD(RateLimit)
     groups_status = []
     for group in groups:
@@ -267,17 +257,9 @@ async def get_my_status(
             key = build_key(group.id, rule["limit_type"], rule["window_sec"], username)
             try:
                 if rule["limit_type"] == "request_limit":
-                    current = (
-                        await get_window_count(redis_client, key, rule["window_sec"])
-                        if redis_client
-                        else 0
-                    )
+                    current = await get_window_count(key, rule["limit_type"], rule["window_sec"])
                 else:
-                    current = (
-                        await get_window_sum(redis_client, key, rule["window_sec"])
-                        if redis_client
-                        else 0
-                    )
+                    current = await get_window_sum(key, rule["limit_type"], rule["window_sec"])
             except Exception:
                 current = 0
             limit = rule["value"]
@@ -1187,12 +1169,11 @@ async def _get_request_messages(request_id: str, session: AsyncSession) -> dict:
         raise HTTPException(status_code=404, detail="日志记录不存在")
 
     date_str = parse_date_str(log.created_at)
-    path = get_request_log_path(request_id, date_str)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="消息文件不存在")
-
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(None, read_log, path)
+    try:
+        data = await loop.run_in_executor(None, read_log_sync, date_str, request_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="消息文件不存在")
     return data
 
 
@@ -1243,16 +1224,29 @@ async def _query_logs(
     )
     rows = (await session.execute(stmt)).all()
 
-    return {
-        "data": [
+    data = []
+    for row in rows:
+        # ExecSession 后端返回扁平 dict 行（usage_logs.* + token_name/token_username 标签列）；
+        # 真 AsyncEngine 返回 (UsageLog, token_name, token_username) 元组。
+        if isinstance(row, dict):
+            d = dict(row)
+            token_name = d.pop("token_name", None)
+            token_username = d.pop("token_username", None)
+            known = UsageLog.model_fields.keys()
+            log = UsageLog(**{k: v for k, v in d.items() if k in known})
+        else:
+            log, token_name, token_username = row
+        data.append(
             {
                 **log.model_dump(),
                 "token_name": token_name,
                 # UsageLog.username 冗余存储，Token 删除后仍可追溯；兜底取 Token.username（兼容旧数据）
                 "username": log.username or token_username,
             }
-            for log, token_name, token_username in rows
-        ],
+        )
+
+    return {
+        "data": data,
         "total": total,
         "page": page,
         "page_size": page_size,

@@ -15,7 +15,7 @@ from fastapi import Depends, Header, HTTPException
 from jose import JWTError, jwt
 from loguru import logger
 from sqlmodel import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from db.database import AsyncSession
 
 from db.models import AdminUser
 

@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 from middleware.auth import AuthMiddleware
 from db.database import init_db, engine
 from db.models import Channel
-from sqlalchemy.ext.asyncio import AsyncSession
+from db.database import AsyncSession
 from sqlmodel import select, col
 from services.quota import check_quota, update_usage, update_user_balance
 from services.pricing import calculate_cost
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
     # 初始化超级管理员（若 SUPERADMIN_USERNAME 已配置）
     from services.auth_service import init_superadmin
     from db.database import engine
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from db.database import AsyncSession
     try:
         async with AsyncSession(engine) as session:
             await init_superadmin(session)
@@ -427,15 +427,13 @@ async def _update_rate_limit_counters(
     cost_usd: float,
     username: str | None = None,
 ) -> None:
-    """响应后更新 Redis 限流计数（fire-and-forget）。username 存在时使用 per-user key。"""
+    """响应成功转发后更新 PG 限流计数（原子 UPSERT）。username 存在时使用 per-user key。"""
     try:
-        from middleware.auth import _get_redis
-        from services.rate_limit_redis import build_key, record_request, record_value
+        from services.rate_limit_db import build_key, record_request, record_value
         from fastcrud import FastCRUD
         from db.models import RateLimit
-        from sqlalchemy.ext.asyncio import AsyncSession
+        from db.database import AsyncSession
 
-        redis_client = await _get_redis()
         async with AsyncSession(engine) as session:
             crud = FastCRUD(RateLimit)
             result = await crud.get_multi(session, group_id=group_id)
@@ -444,13 +442,13 @@ async def _update_rate_limit_counters(
                     continue
                 key = build_key(group_id, rule["limit_type"], rule["window_sec"], username)
                 if rule["limit_type"] == "request_limit":
-                    await record_request(redis_client, key, rule["window_sec"], request_id)
+                    await record_request(key, rule["limit_type"], rule["window_sec"], request_id)
                 elif rule["limit_type"] == "token_limit":
-                    await record_value(redis_client, key, rule["window_sec"], request_id, input_tokens + output_tokens)
+                    await record_value(key, rule["limit_type"], rule["window_sec"], request_id, input_tokens + output_tokens)
                 elif rule["limit_type"] == "quota_limit":
-                    await record_value(redis_client, key, rule["window_sec"], request_id, cost_usd)
+                    await record_value(key, rule["limit_type"], rule["window_sec"], request_id, cost_usd)
     except Exception:
-        logger.exception(f"Redis 限流计数更新失败 (group_id={group_id})")
+        logger.exception(f"限流计数更新失败 (group_id={group_id})")
 
 
 @dataclasses.dataclass
@@ -868,6 +866,9 @@ async def forward_request(
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
+    # 平台网关注入的内部头（x-cloudbase-context 可能携带临时凭证）绝不转发给上游
+    for _hk in [k for k in headers if k.lower().startswith(("x-cloudbase", "x-tencent"))]:
+        headers.pop(_hk, None)
     # 渠道级压缩控制：作为反向代理，网关需读取/解析响应体（SSE 计费）。
     # 部分上游（如 APISIX）在 Accept-Encoding 含 br/zstd 时会压缩响应却不回传
     # Content-Encoding 头，导致 httpx 无法自动解压、响应流乱码且无法计费——
@@ -1061,16 +1062,16 @@ async def forward_request(
             request.app.state.log_tasks.add(usage_task)
             usage_task.add_done_callback(request.app.state.log_tasks.discard)
 
-            # After 阶段：更新 Redis 限流计数（fire-and-forget）
+            # After 阶段：更新限流计数（同步）
             if _group_id:
-                asyncio.create_task(_update_rate_limit_counters(
+                await _update_rate_limit_counters(
                     group_id=_group_id,
                     request_id=request_id,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cost_usd=_cost_usd,
                     username=getattr(request.state, "token_username", None),
-                ))
+                )
 
             # After 阶段：扣减用户余额（fire-and-forget）
             asyncio.create_task(_maybe_deduct(

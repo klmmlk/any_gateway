@@ -46,3 +46,11 @@ cloudbaserc.json
 
 # 云托管部署目录（含密钥）
 deploy_src/
+
+# SCF 云函数构建产物（依赖体积大，不入库）
+cloudfunctions/any_gateway_http/
+cloudfunctions/*.zip
+
+# mcporter 本地 MCP 调用配置
+config/mcporter.json
+.scf-repro-venv/

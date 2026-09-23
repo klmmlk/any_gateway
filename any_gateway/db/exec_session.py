@@ -70,6 +70,20 @@ def _obj_to_insert(obj, table) -> str:
     )
 
 
+def _obj_to_update(obj, table) -> str:
+    """把 ORM 对象转成 UPDATE 语句（按主键定位，更新所有非主键字段）。
+    标 _was_loaded 的对象走这条路径（exec_sql_backend.attach_orm_class 注入）。"""
+    pk_cols = list(table.primary_key.columns.keys())
+    sets = []
+    for col in table.columns.keys():
+        if col in pk_cols:
+            continue
+        v = getattr(obj, col, None)
+        sets.append(f"{col} = {_render_literal(v)}")
+    conds = " AND ".join(f"{c} = {_render_literal(getattr(obj, c))}" for c in pk_cols)
+    return f"UPDATE {table.name} SET {', '.join(sets)} WHERE {conds}"
+
+
 class ExecSession:
     """兼容 `async with AsyncSession(engine) as session` 用法的最小子集。"""
 
@@ -80,16 +94,25 @@ class ExecSession:
 
     # ---- 入口 ----
     async def execute(self, statement, params: Optional[Dict[str, Any]] = None, **kw):
-        sql = compile_sql(statement, params)
-        res = await self._conn.execute(sa_text(sql))
-        # ORM 实体查询（select(Model)）：scalars() 应返回整行 dict 而非第一列标量
-        is_orm = False
+        # ORM 实体查询必须在编译成 text 前判定；text() 自身没有 column_descriptions，
+        # 但 sqlalchemy.sql.expression.Select/Update/Delete 有，按 ORM 模式跑出整行
+        # 才能让 scalar_one_or_none() 返回 dict 行而不是首列标量。
+        orm_cls = None
         try:
             descs = getattr(statement, "column_descriptions", None)
-            is_orm = bool(descs and descs[0].get("entity") is not None)
+            if descs and isinstance(descs, list):
+                for d in descs:
+                    if d and d.get("entity") is not None:
+                        orm_cls = d["entity"]
+                        break
         except Exception:
-            is_orm = False
-        res._orm_mode = is_orm
+            orm_cls = None
+        sql = compile_sql(statement, params)
+        res = await self._conn.execute(sa_text(sql))
+        res._orm_mode = orm_cls is not None
+        res._orm_class = orm_cls
+        if orm_cls is not None:
+            res.attach_orm_class(orm_cls)
         return res
 
     async def get(self, model, ident, **kw):
@@ -116,7 +139,11 @@ class ExecSession:
 
     async def flush(self):
         for obj in self._pending_adds:
-            sql = _obj_to_insert(obj, obj.__table__)
+            # attach_orm_class 注入的"已持久化"标记：有 _was_loaded 视为 UPDATE 目标
+            if getattr(obj, "_was_loaded", False):
+                sql = _obj_to_update(obj, obj.__table__)
+            else:
+                sql = _obj_to_insert(obj, obj.__table__)
             await self._conn.execute(sa_text(sql))
         self._pending_adds.clear()
 

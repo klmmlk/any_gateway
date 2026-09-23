@@ -22,10 +22,12 @@ from loguru import logger
 # TCB SDK 是同步的（基于 requests），而 SQLAlchemy AsyncEngine 要求 conn.execute 是 coroutine。
 # 我们用 asyncio.to_thread 包一层即可。
 
-_secret_id = os.getenv("TENCENTCLOUD_SECRETID")
-_secret_key = os.getenv("TENCENTCLOUD_SECRETKEY")
+# SCF 等平台保留 TENCENTCLOUD_ 前缀（自动注入临时凭证），云函数侧改用 TC_ 前缀；
+# 回退原名以兼容本地开发与云托管环境。
+_secret_id = os.getenv("TC_SECRET_ID") or os.getenv("TENCENTCLOUD_SECRETID")
+_secret_key = os.getenv("TC_SECRET_KEY") or os.getenv("TENCENTCLOUD_SECRETKEY")
 _env_id = os.getenv("CLOUDBASE_ENV_ID") or os.getenv("TCB_ENV_ID")
-_region = os.getenv("TENCENTCLOUD_REGION", "ap-shanghai")
+_region = os.getenv("TC_REGION") or os.getenv("TENCENTCLOUD_REGION") or "ap-shanghai"
 
 _client_lock = threading.Lock()
 _tcb_client = None
@@ -54,19 +56,33 @@ def _get_client():
 def _exec_sql_sync(sql: str) -> Tuple[List[str], List[List[str]], int]:
     """同步调用 ExecutePGSql，返回 (columns, rows, affected_rows)。
 
+    ExecutePGSql 有账号级每秒频率上限（约 20 QPS）；多并发请求的 SQL 突发会触发
+    RequestLimitExceeded，这里指数退避重试把突发摊平而不是直接失败。
+
     抛出:
-        OperationalError: PG SQL 错误
+        OperationalError: PG SQL 错误 / 重试后仍失败
     """
+    import random
+    import time
+
     from tencentcloud.tcb.v20180608 import models
 
     client = _get_client()
     req = models.ExecutePGSqlRequest()
     req.EnvId = _env_id
     req.Sql = sql
-    try:
-        resp = client.ExecutePGSql(req)
-    except Exception as e:  # network / auth
-        raise OperationalError("ExecutePGSql call failed", params=sql, orig=e) from e
+
+    max_attempts = 5  # 1 次原始调用 + 4 次退避重试（0.12/0.24/0.48/0.96s ± 抖动）
+    for attempt in range(max_attempts):
+        try:
+            resp = client.ExecutePGSql(req)
+            break
+        except Exception as e:  # network / auth / rate limit
+            code = str(getattr(e, "code", "") or "")
+            if "RequestLimitExceeded" in code and attempt < max_attempts - 1:
+                time.sleep(0.12 * (2 ** attempt) + random.uniform(0, 0.08))
+                continue
+            raise OperationalError("ExecutePGSql call failed", params=sql, orig=e) from e
 
     # 把 PG 错误信息翻译为 ProgrammingError
     if resp.Columns is None and (not resp.Rows or resp.Rows == ["[]"]):
@@ -138,6 +154,70 @@ class _MappingsView(_RowsView):
         super().__init__(rows, columns)
 
 
+class _RowDict(dict):
+    """结果行：dict 语义 + ORM 实体式属性访问（业务代码普遍写 channel.models 这类点取值）。"""
+
+    @property
+    def _mapping(self):
+        return self
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+    def model_dump(self, **kwargs):
+        # 业务代码把查询结果当 SQLModel 实体用（t.model_dump()），这里返回普通 dict 视图
+        return dict(self)
+
+    @property
+    def __class__(self):
+        # 业务代码常调 obj.__table__（SQLAlchemy class-level 属性）；
+        # 普通 dict 的 __getattr__ 兜不到 class-level 查询。把类伪装成目标 ORM 实体类，
+        # 让 isinstance/属性查找走 SQLAlchemy 的路径。_orm_class 由 ExecSession 在
+        # ORM 模式 execute 时注入到每行的隐藏键。
+        orm_cls = dict.get(self, "_orm_class")
+        if orm_cls is not None:
+            return orm_cls
+        return type(self).__mro__[0]
+
+    @property
+    def __class__(self):
+        # 业务代码常调 voucher.__table__（SQLAlchemy class-level 属性）；
+        # dict 行的 __getattr__ 兜不到 class-level 查询。把类伪装成 ORM 实体类，
+        # 让 isinstance/属性查找走 SQLAlchemy 的路径。
+        orm_cls = self.get("_orm_class") or type(self).__mro__[0].__mro__[-1]
+        return orm_cls
+
+
+# ExecutePGSql 把所有 PG 类型序列化成文本（bool→'false'、int→'0'、NULL→None），
+# 业务代码直接拿值做布尔判断/数值比较会全线误判。按值形状保守还原：
+# 只还原无歧义的 true/false 与纯数字，其余（时间戳、JSON 文本、sk- key 等）保持字符串。
+import re as _re
+
+_INT_RE = _re.compile(r"^-?\d+$")
+_FLOAT_RE = _re.compile(r"^-?\d+\.\d+(e[+-]?\d+)?$", _re.I)
+
+
+def _coerce_value(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        if v == "true":
+            return True
+        if v == "false":
+            return False
+        if _INT_RE.match(v):
+            return int(v)
+        if _FLOAT_RE.match(v):
+            return float(v)
+    return v
+
+
 class ExecSqlResult:
     """AsyncSession.execute() 的返回值代理，最小实现。"""
 
@@ -157,11 +237,31 @@ class ExecSqlResult:
             parsed_rows.append(self._to_row(columns, values))
         self._row_tuples = parsed_rows
 
+    def attach_orm_class(self, orm_cls):
+        """由 ExecSession 在 ORM 模式 execute 后调用：把每行替换为 SQLModel 实例，
+        满足 obj.__table__ / isinstance / FastCRUD 的 ._mapping 等查询。"""
+        from sqlmodel import SQLModel
+        self._orm_class = orm_cls
+        if not (isinstance(orm_cls, type) and issubclass(orm_cls, SQLModel)):
+            return
+        # FastCRUD 调 result._mapping 期望拿到 Mapping 行；给 orm_cls 加 property。
+        # SQLModel 实例本身是 dict-like（Pydantic model_dump），property 即可。
+        if not hasattr(orm_cls, "_mapping"):
+            orm_cls._mapping = property(lambda self: self)
+        new_rows = []
+        for row in self._row_tuples:
+            field_names = set(orm_cls.model_fields.keys())
+            clean = {k: row.get(k) for k in field_names if k in row}
+            obj = orm_cls(**clean)
+            obj._was_loaded = True
+            new_rows.append(obj)
+        self._row_tuples = new_rows
+
     def _to_row(self, columns: List[str], values: List[str]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for i, col in enumerate(columns):
-            out[col] = values[i] if i < len(values) else None
-        return out
+            out[col] = _coerce_value(values[i]) if i < len(values) else None
+        return _RowDict(out)
 
     def scalars(self):
         # ORM 实体查询时返回整行 dict（近似 ORM 实体），否则返回第一列标量
@@ -179,11 +279,22 @@ class ExecSqlResult:
     def first(self):
         return self._row_tuples[0] if self._row_tuples else None
 
+    def scalar(self):
+        if not self._row_tuples:
+            return None
+        # ORM 实体查询：真 SQLAlchemy 的 scalar* 返回实体而非首列；
+        # 本后端用整行 dict 近似实体（_orm_mode 由 ExecSession 按 column_descriptions 设置）。
+        if getattr(self, "_orm_mode", False):
+            return self._row_tuples[0]
+        return self._row_tuples[0][self._columns[0]] if self._columns else None
+
     def scalar_one_or_none(self):
         if not self._row_tuples:
             return None
         if len(self._row_tuples) > 1:
             raise RuntimeError(f"multiple rows returned")
+        if getattr(self, "_orm_mode", False):
+            return self._row_tuples[0]
         first = self._row_tuples[0]
         return first[self._columns[0]] if self._columns else None
 

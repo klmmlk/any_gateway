@@ -1,0 +1,12 @@
+#!/bin/bash
+# SCF HTTP 云函数启动入口：Web Server 必须监听 9000 端口。
+# Python3.10 运行时解释器在 /var/lang/python310；/var/lang/python3 是旧 3.6，仅作兜底排序在前。
+PY=""
+for p in /var/lang/python310/bin/python3 /var/lang/python3.10/bin/python3 python3; do
+  if command -v "$p" >/dev/null 2>&1; then PY="$p"; break; fi
+done
+[ -z "$PY" ] && { echo "python3 interpreter not found" >&2; exit 1; }
+
+export PYTHONPATH="/var/user:${PYTHONPATH}"
+cd /var/user
+exec "$PY" -m uvicorn gateway:app --host 0.0.0.0 --port 9000 --app-dir any_gateway

@@ -318,3 +318,28 @@ class GroupModelPriceUpdate(SQLModel):
     model_name: str | None = None
     unit: str | None = None
     price_per_unit: float | None = None
+
+
+# =======================
+# RateLimitCounter（限流计数器，DB 实现状态表）
+# =======================
+
+
+class RateLimitCounter(SQLModel, table=True):
+    """固定窗口限流计数器，替代 Redis ZSET 滑动窗口（去 Redis 化改造）。
+
+    - subject_key：限流主体（group 级或 per-user 级），格式与原 Redis key 一致，
+      由 services.rate_limit_db.build_key 生成
+    - window_start：固定窗口起点（epoch 秒，int(now // window_sec) * window_sec）
+    - count：计数型（request_limit）窗口内成功转发的请求数
+    - amount：求和型（token_limit / quota_limit）窗口内累计值
+
+    检查（读）与记录（原子 UPSERT 递增）分离，语义与原 Redis 实现对齐：
+    被拒绝/失败的请求不计入。过期行由写入路径机会式清理，无需定时任务。
+    """
+    __tablename__ = "rate_limit_counters"
+    subject_key: str = Field(primary_key=True, max_length=512)
+    limit_type: str = Field(primary_key=True, max_length=32)
+    window_start: int = Field(primary_key=True)
+    count: int = Field(default=0)
+    amount: float = Field(default=0)
