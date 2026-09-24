@@ -473,6 +473,60 @@ async def _resolve_token_for_ws(api_key: str) -> dict | None:
     return token
 
 
+def _extract_asr_summary(upstream_texts: list[str]) -> dict:
+    """从捕获的上游文本帧中尽力提取 ASR 识别摘要（DashScope 事件格式）。
+
+    透传阶段不解析业务协议；这里仅在会话结束后离线解析，任何解析失败都只是
+    拿不到转写，不影响计费与日志落盘。句界判定与 bench_asr_ws.py 实测语义一致：
+    同句 partial 逐步增长（取最后一个）、**新句以空 text 的 partial 开头**；
+    is_end 帧作为补充定稿信号。返回 {transcript, errors, upstream_sample?}：
+    - transcript: 各句最终文本直接拼接（中文无空格）
+    - errors: header.error_code / error_message 中的上游错误
+    - upstream_sample: 什么都没解析出来时，保留少量原始帧样本便于排查
+    """
+    sentences: list[str] = []
+    current = ""
+    errors: list[str] = []
+    for text in upstream_texts:
+        try:
+            frame = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(frame, dict):
+            continue
+        header = frame.get("header")
+        if isinstance(header, dict):
+            err_code = header.get("error_code")
+            err_msg = header.get("error_message")
+            if err_code or err_msg:
+                errors.append(f"[{err_code}] {err_msg}")
+        payload = frame.get("payload")
+        sentence = payload.get("output", {}).get("sentence") if isinstance(payload, dict) else None
+        if isinstance(sentence, dict):
+            s_text = sentence.get("text")
+            if isinstance(s_text, str):
+                if s_text == "":
+                    # 新句以空 partial 开头：上一句到此定稿
+                    if current:
+                        sentences.append(current)
+                        current = ""
+                else:
+                    current = s_text
+            if sentence.get("is_end") and current:
+                sentences.append(current)
+                current = ""
+    if current:
+        sentences.append(current)
+
+    summary: dict = {
+        "transcript": "".join(sentences),
+        "errors": errors,
+    }
+    if not summary["transcript"] and not errors and upstream_texts:
+        summary["upstream_sample"] = upstream_texts[:5]
+    return summary
+
+
 async def _finalize_asr_usage(
     *,
     request_id: str,
@@ -482,12 +536,18 @@ async def _finalize_asr_usage(
     wall_duration_seconds: float,
     channel_id: str | None = None,
     status: int = 200,
+    upstream_url: str = "",
+    meta: dict | None = None,
+    counters: dict | None = None,
+    upstream_texts: list[str] | None = None,
 ) -> None:
-    """ASR WebSocket 收尾：计费 + UsageLog 落库（fire-and-forget）。
+    """ASR WebSocket 收尾：计费 + UsageLog 落库 + 消息文件落盘（fire-and-forget）。
 
     与 _finalize_stream_usage 镜像：调 calculate_cost（按 audio_seconds 维度）、
     update_usage（写入 audio_seconds 字段），最后扣余额。
-    所有失败仅记录日志，不影响客户端（连接已关闭）。
+    UsageLog 落库成功后，同步写一份与 HTTP 转发同构的消息日志文件
+    （data/sessions/<date>/<request_id>.json.br），否则管理端日志详情会显示
+    "（暂无消息记录）"。所有失败仅记录日志，不影响客户端（连接已关闭）。
     """
     group_id = token.get("group_id")
     username = token.get("username")
@@ -508,6 +568,7 @@ async def _finalize_asr_usage(
         logger.exception(f"ASR 计费失败 (request_id={request_id})")
         return
 
+    usage_saved = False
     try:
         await update_usage(
             token_id=token.get("id"),
@@ -524,8 +585,44 @@ async def _finalize_asr_usage(
             covered_by_package=False,  # WS 端点当前未走套餐检查
             audio_seconds=audio_seconds,
         )
+        usage_saved = True
     except Exception:
         logger.exception(f"ASR usage 落库失败 (request_id={request_id})")
+
+    if usage_saved:
+        # 消息文件与 UsageLog 行配对：只在 DB 行存在时落盘，避免孤儿文件
+        summary = {
+            **_extract_asr_summary(upstream_texts or []),
+            "audio_duration_seconds": audio_seconds,
+            "wall_duration_seconds": wall_duration_seconds,
+            "frames": counters or {},
+        }
+        log_task = asyncio.create_task(log_writer.enqueue_log({
+            "timestamp": timestamp(),
+            "method": "WS",
+            "path": "/v1/audio/asr/stream",
+            "request_url": upstream_url,
+            "request_headers": {},
+            "request_body": json.dumps(
+                {"stream": "websocket", **(meta or {}), "model": model},
+                ensure_ascii=False,
+            ),
+            "response_status": status,
+            "response_headers": {},
+            "response_body": json.dumps(summary, ensure_ascii=False),
+            "duration_ms": wall_duration_seconds * 1000.0,
+            "model_name": model,
+            "backend_url": upstream_url,
+            "is_stream": True,
+            "token_id": token.get("id"),
+            "request_id": request_id,
+        }))
+        try:
+            app.state.log_tasks.add(log_task)
+            log_task.add_done_callback(app.state.log_tasks.discard)
+        except AttributeError:
+            # app.state.log_tasks 未初始化（如测试环境）——任务仍会独立完成
+            pass
 
     # 扣减余额（fire-and-forget）
     try:
@@ -1806,6 +1903,10 @@ async def _forward_responses_stream(
 # =======================
 # WebSocket 端点：实时 ASR 中转
 # =======================
+# 上游文本帧捕获预算（字符数）：仅供会话结束后离线提取转写文本落日志，
+# 用尽即截断，防止长会话日志无界膨胀。brotli 对这类重复 JSON 压缩率很高。
+_ASR_UPSTREAM_CAPTURE_BUDGET = 64 * 1024
+
 # 客户端 URL 形式：
 #   wss://gateway.example.com/v1/audio/asr/stream
 #     ?model=qwen-audio-3.0-asr-flash-streaming
@@ -1887,6 +1988,8 @@ async def ws_audio_asr_stream(websocket: WebSocket):
     request_id = uuid4().hex
     status_code = 200
     duration_seconds = 0.0
+    session_counters: dict = {}
+    upstream_texts: list[str] = []
     try:
         result = await forward_ws_session(
             client_ws=websocket,
@@ -1896,8 +1999,11 @@ async def ws_audio_asr_stream(websocket: WebSocket):
             disable_ssl=backend.get("disable_ssl", False),
             subprotocols=subprotocols,
             on_meta=on_meta,
+            capture_upstream_text=_ASR_UPSTREAM_CAPTURE_BUDGET,
         )
         duration_seconds = float(result.get("duration_seconds") or 0.0)
+        session_counters = result.get("counters") or {}
+        upstream_texts = result.get("upstream_texts") or []
     except WebSocketDisconnect:
         # 客户端主动断开，视为正常关闭
         pass
@@ -1928,6 +2034,10 @@ async def ws_audio_asr_stream(websocket: WebSocket):
                 wall_duration_seconds=duration_seconds,
                 channel_id=backend.get("channel_id"),
                 status=status_code,
+                upstream_url=upstream_url,
+                meta=meta,
+                counters=session_counters,
+                upstream_texts=upstream_texts,
             )
 
 

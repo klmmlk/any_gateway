@@ -259,6 +259,16 @@ export const parseResponseParts = (bodyStr?: string): ParsedResponseContent => {
       }
     }
 
+    // ASR WebSocket 会话摘要：transcript 为识别正文，其余字段（时长/帧计数等）
+    // 作为附带的 JSON 块展示
+    if (typeof obj.transcript === 'string' && obj.transcript) {
+      const rest = { ...obj, transcript: undefined }
+      let restStr = ''
+      try { restStr = JSON.stringify(rest, null, 2) } catch { /* ignore */ }
+      const content = obj.transcript + (restStr && restStr !== '{}' ? `\n\n\`\`\`json\n${restStr}\n\`\`\`` : '')
+      return { ...empty, content }
+    }
+
     return { ...empty, content: extractDeltaText(obj) ?? JSON.stringify(obj, null, 2) }
   } catch {
     return { ...empty, content: bodyStr }

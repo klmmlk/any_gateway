@@ -84,12 +84,24 @@ async def _upstream_to_client(
     upstream: websockets.WebSocketClientProtocol,
     client_ws: WebSocket,
     counters: dict,
+    capture: Optional[dict] = None,
 ) -> None:
-    """上游 → 客户端：按上游消息类型原样 send。"""
+    """上游 → 客户端：按上游消息类型原样 send。
+
+    capture 非空时，把上游文本帧原样收集到 capture["texts"]，
+    直到剩余预算 capture["budget"] 用尽（置 truncated 标记，不再捕获）。
+    只存原始帧、不解析协议，供会话结束后离线提取（如 ASR 转写文本）。
+    """
     async for raw in upstream:
         if isinstance(raw, str):
             await client_ws.send_text(raw)
             counters["upstream_text"] += 1
+            if capture is not None:
+                if len(raw) <= capture["budget"]:
+                    capture["budget"] -= len(raw)
+                    capture["texts"].append(raw)
+                else:
+                    capture["truncated"] = True
         else:
             # websockets>=12 的消息对象同时支持 str/bytes；raw 也可能是 Iterable[bytes]
             data = bytes(raw) if not isinstance(raw, (bytes, bytearray)) else raw
@@ -108,13 +120,19 @@ async def forward_ws_session(
     subprotocols: Optional[list[str]] = None,
     on_meta: OnMetaHook = None,
     open_timeout: float = 30.0,
+    capture_upstream_text: int = 0,
 ) -> dict:
     """建立上游 wss 连接，并在客户端与上游之间做双向 pump。
+
+    capture_upstream_text > 0 时，捕获上游文本帧原文（总字符数不超过该值），
+    用于会话结束后落日志/离线解析；0 表示不捕获。
 
     Returns: dict，包含
         - duration_seconds: float，WS 会话墙钟时长
         - meta: dict，第一帧客户端 JSON 文本的解析结果（若有）
         - counters: dict，{client_text, client_bytes, upstream_text, upstream_bytes}
+        - upstream_texts: list[str]，捕获的上游文本帧原文（可能截断）
+        - upstream_texts_truncated: bool，是否因预算用尽而截断
         - upstream_subprotocol: str | None，上游选定的子协议
 
     Raises:
@@ -147,6 +165,10 @@ async def forward_ws_session(
         "upstream_text": 0,
         "upstream_bytes": 0,
     }
+    capture: Optional[dict] = (
+        {"budget": capture_upstream_text, "texts": [], "truncated": False}
+        if capture_upstream_text > 0 else None
+    )
 
     # websockets>=12 的 connect 是 async context manager。
     # 这里我们手工管理连接生命周期，便于在 gather 异常时显式 close。
@@ -166,7 +188,7 @@ async def forward_ws_session(
             _client_to_upstream(client_ws, upstream, on_meta, meta_seen, counters)
         )
         upstream_task = asyncio.create_task(
-            _upstream_to_client(upstream, client_ws, counters)
+            _upstream_to_client(upstream, client_ws, counters, capture)
         )
         done, pending = await asyncio.wait(
             {client_task, upstream_task},
@@ -196,5 +218,7 @@ async def forward_ws_session(
         "duration_seconds": time.monotonic() - started,
         "meta": meta_seen.get("payload"),
         "counters": counters,
+        "upstream_texts": capture["texts"] if capture else [],
+        "upstream_texts_truncated": capture["truncated"] if capture else False,
         "upstream_subprotocol": upstream.subprotocol,
     }

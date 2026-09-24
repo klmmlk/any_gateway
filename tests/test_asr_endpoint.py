@@ -315,7 +315,10 @@ async def test_quota_exceeded_closes_with_1008(server_url):
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_passthrough_with_billing(server_url):
+async def test_end_to_end_passthrough_with_billing(server_url, tmp_path, monkeypatch):
+    import log_writer
+    monkeypatch.setattr(log_writer, "LOG_BASE_DIR", tmp_path)
+
     ch_id, api_key = await _seed_channel_and_token(api_key="sk-ase2e00001")
     upstream = UpstreamEcho()
     upstream.start_in_thread()
@@ -352,6 +355,30 @@ async def test_end_to_end_passthrough_with_billing(server_url):
         assert log.audio_seconds == 7.5
         assert log.model == "qwen-audio-3.0-asr-flash-streaming"
         assert log.channel_id == ch_id
+
+        # 消息文件应已落盘（管理端日志详情读它；缺失即显示"暂无消息记录"）
+        import log_writer as _lw
+        path = _lw.get_request_log_path(log.id, _lw.parse_date_str(log.created_at))
+        record = None
+        for _ in range(20):  # brotli 压缩落盘在后台 task 中，轮询等待
+            if path.exists():
+                record = _lw.read_log(path)
+                break
+            await asyncio.sleep(0.1)
+        assert record is not None, f"消息文件未落盘: {path}"
+        assert record["request_id"] == log.id
+        assert record["method"] == "WS"
+        assert record["model_name"] == "qwen-audio-3.0-asr-flash-streaming"
+        req = json.loads(record["request_body"])
+        assert req["model"] == "qwen-audio-3.0-asr-flash-streaming"
+        assert req["audio_duration_seconds"] == 7.5
+        assert req["stream"] == "websocket"
+        resp = json.loads(record["response_body"])
+        assert resp["audio_duration_seconds"] == 7.5
+        # echo 上游回的不是 DashScope 帧 → 无 transcript，保留原始帧样本
+        assert "frame-1" in resp.get("upstream_sample", [])
+        assert resp["frames"]["client_text"] == 3  # meta 帧 + 2 条透传文本
+        assert resp["frames"]["upstream_text"] == 2
     finally:
         upstream.stop()
 
@@ -380,3 +407,93 @@ async def test_no_meta_falls_back_to_wall_clock(server_url):
         assert log.audio_seconds > 0
     finally:
         upstream.stop()
+
+
+# ============================================================
+# _extract_asr_summary：DashScope 上游帧离线解析
+# ============================================================
+def _dashscope_frame(event="result-generated", sentence=None, error_code=None, error_message=None):
+    header: dict = {"task_id": "t1", "event": event}
+    if error_code or error_message:
+        header["error_code"] = error_code
+        header["error_message"] = error_message
+    payload = {"output": {"sentence": sentence}} if sentence is not None else {}
+    return json.dumps({"header": header, "payload": payload}, ensure_ascii=False)
+
+
+def test_extract_asr_summary_prefers_ended_sentences():
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(sentence={"text": "你好", "is_end": False}),
+        _dashscope_frame(sentence={"text": "你好世界", "is_end": True}),
+        _dashscope_frame(sentence={"text": "今天天气", "is_end": False}),
+        _dashscope_frame(sentence={"text": "今天天气很好", "is_end": True}),
+        _dashscope_frame(event="task-finished"),
+    ]
+    summary = _gw._extract_asr_summary(frames)
+    # 同句取最后一个 partial；is_end 定稿
+    assert summary["transcript"] == "你好世界今天天气很好"
+    assert summary["errors"] == []
+    assert "upstream_sample" not in summary
+
+
+def test_extract_asr_summary_real_stream_shape():
+    """实测形态：partial 逐步增长、新句以空 text partial 开头、无 is_end。"""
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(sentence={"text": "今天"}),
+        _dashscope_frame(sentence={"text": "今天天气"}),
+        _dashscope_frame(sentence={"text": ""}),  # 新句开始 → 上一句定稿
+        _dashscope_frame(sentence={"text": "很好"}),
+        _dashscope_frame(sentence={"text": "很好啊", "is_end": True}),
+        _dashscope_frame(event="task-finished"),
+    ]
+    summary = _gw._extract_asr_summary(frames)
+    assert summary["transcript"] == "今天天气很好啊"
+
+
+def test_extract_asr_summary_unclosed_last_sentence_kept():
+    """流结束时最后一句未收到空 partial/is_end，也应保留。"""
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(sentence={"text": "还没说"}),
+        _dashscope_frame(sentence={"text": "还没说完"}),
+        _dashscope_frame(event="task-finished"),
+    ]
+    summary = _gw._extract_asr_summary(frames)
+    assert summary["transcript"] == "还没说完"
+
+
+def test_extract_asr_summary_collects_errors():
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(
+            event="task-failed",
+            error_code="InvalidParameter",
+            error_message="sample_rate is required",
+        ),
+    ]
+    summary = _gw._extract_asr_summary(frames)
+    assert summary["transcript"] == ""
+    assert summary["errors"] == ["[InvalidParameter] sample_rate is required"]
+    assert "upstream_sample" not in summary
+
+
+def test_extract_asr_summary_keeps_sample_for_unparsed_frames():
+    import gateway as _gw
+
+    summary = _gw._extract_asr_summary(["frame-1", "not-json", "frame-3"])
+    assert summary["transcript"] == ""
+    assert summary["errors"] == []
+    assert summary["upstream_sample"] == ["frame-1", "not-json", "frame-3"]
+
+
+def test_extract_asr_summary_empty_input():
+    import gateway as _gw
+
+    summary = _gw._extract_asr_summary([])
+    assert summary == {"transcript": "", "errors": []}

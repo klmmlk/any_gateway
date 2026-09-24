@@ -277,3 +277,88 @@ async def test_disable_ssl_ignored_for_ws(upstream):
         disable_ssl=True,  # 应被忽略
     )
     assert result["duration_seconds"] >= 0
+
+
+# ============================================================
+# Test 7: capture_upstream_text 捕获上游文本帧（预算内收集、超限截断）
+# ============================================================
+@pytest.mark.asyncio
+async def test_capture_upstream_text_budget():
+    """上游推 3 条文本 + 1 条二进制：预算内全收，预算耗尽标记 truncated。"""
+
+    frames = [
+        json.dumps({"header": {"event": "result-generated"}}),
+        json.dumps({"header": {"event": "task-finished"}}),
+        "plain-text-frame",
+    ]
+
+    async def push_handler(ws):
+        for f in frames:
+            await ws.send(f)
+        await ws.send(b"\x01\x02")
+        try:
+            await ws.recv()
+        except websockets.ConnectionClosed:
+            pass
+
+    server = await websockets.serve(push_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    url = f"ws://127.0.0.1:{port}"
+
+    try:
+        ws = StubWebSocket()
+        ws.feed_text("ping")
+        ws.trigger_disconnect()
+
+        # 预算充足：全部文本帧捕获，二进制不参与捕获
+        result = await forward_ws_session(
+            client_ws=ws,
+            upstream_url=url,
+            api_key="test-key",
+            capture_upstream_text=4096,
+        )
+        assert result["upstream_texts"] == frames
+        assert result["upstream_texts_truncated"] is False
+        assert len(ws.sent_text) == 3
+        assert len(ws.sent_bytes) == 1
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    # 预算只够第一帧：后续文本帧丢弃并置 truncated
+    server2 = await websockets.serve(push_handler, "127.0.0.1", 0)
+    port2 = server2.sockets[0].getsockname()[1]
+    try:
+        ws2 = StubWebSocket()
+        ws2.feed_text("ping")
+        ws2.trigger_disconnect()
+
+        result2 = await forward_ws_session(
+            client_ws=ws2,
+            upstream_url=f"ws://127.0.0.1:{port2}",
+            api_key="test-key",
+            capture_upstream_text=len(frames[0]),
+        )
+        assert result2["upstream_texts"] == [frames[0]]
+        assert result2["upstream_texts_truncated"] is True
+        # 透传不受捕获截断影响
+        assert len(ws2.sent_text) == 3
+    finally:
+        server2.close()
+        await server2.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_capture_off_by_default(upstream):
+    """不传 capture_upstream_text 时返回空列表、不截断。"""
+    ws = StubWebSocket()
+    ws.feed_text("ping")
+    ws.trigger_disconnect()
+
+    result = await forward_ws_session(
+        client_ws=ws,
+        upstream_url=upstream.url,
+        api_key="test-key",
+    )
+    assert result["upstream_texts"] == []
+    assert result["upstream_texts_truncated"] is False
