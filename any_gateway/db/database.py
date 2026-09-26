@@ -119,3 +119,13 @@ async def init_db():
         if result.scalar_one_or_none() is None:
             session.add(UserGroup(name="default"))
             await session.commit()
+
+    # 确保支付配置默认行存在（幂等）
+    from db.models import PaymentSetting
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        result = await session.execute(
+            select(PaymentSetting).where(PaymentSetting.id == "default")
+        )
+        if result.scalar_one_or_none() is None:
+            session.add(PaymentSetting(id="default"))
+            await session.commit()

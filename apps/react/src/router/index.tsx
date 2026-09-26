@@ -9,6 +9,7 @@ import Dashboard from '../pages/Dashboard'
 import Groups from '../pages/Groups'
 import Home from '../pages/Home'
 import Docs from '../pages/Docs'
+import Payment from '../pages/Payment'
 import PublicPricing from '../pages/Pricing/public'
 import Logs from '../pages/Logs'
 import Prices from '../pages/Prices'
@@ -74,6 +75,14 @@ const router = createBrowserRouter([
         element: (
           <AuthGuard roles={['admin', 'superadmin']}>
             <Vouchers />
+          </AuthGuard>
+        ),
+      },
+      {
+        path: 'payment',
+        element: (
+          <AuthGuard roles={['admin', 'superadmin']}>
+            <Payment />
           </AuthGuard>
         ),
       },

@@ -7,24 +7,28 @@ Admin CRUD API 路由。
 """
 
 import asyncio
+import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
 from functools import cmp_to_key
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from constants import SKIP_SSL_VERIFY
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastcrud import FastCRUD, crud_router
 from jose import JWTError
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import asc, desc, delete, func, select
+from sqlalchemy import asc, desc, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.database import async_session_generator
@@ -39,6 +43,11 @@ from db.models import (
     ModelPrice,
     ModelPriceCreate,
     ModelPriceUpdate,
+    PaymentOrder,
+    PaymentPackage,
+    PaymentPackageCreate,
+    PaymentPackageUpdate,
+    PaymentSetting,
     RateLimit,
     RateLimitCreate,
     RateLimitUpdate,
@@ -55,6 +64,7 @@ from db.models import (
 )
 from log_writer import get_request_log_path, read_log, parse_date_str
 from services.auth_service import require_auth, require_role, verify_token
+from services.payment import get_order_key, mark_order_paid_and_deliver
 
 # ---------------------------------------------------------------------------
 # Admin Key 验证依赖
@@ -2231,3 +2241,577 @@ async def batch_delete_vouchers(
     result = await session.execute(delete(Voucher).where(Voucher.id.in_(body.ids)))
     await session.commit()
     return {"deleted": result.rowcount}
+
+
+# ---------------------------------------------------------------------------
+# 支付：渠道配置 / 套餐 / 订单（admin 与外部软件集成共用，x-admin-key 或 Admin JWT）
+# ---------------------------------------------------------------------------
+
+payment_router = APIRouter(
+    prefix="/admin/payment",
+    tags=["Admin: Payment"],
+    dependencies=[Depends(require_admin_access)],
+)
+
+
+class PaymentSettingsUpdate(BaseModel):
+    gateway_base_url: str | None = None
+    api_key: str | None = None  # 空/缺省 = 保持原值
+    callback_secret: str | None = None  # 空/缺省 = 保持原值
+    public_base_url: str | None = None
+    enabled_channels: list[str] | None = None
+    enabled: bool | None = None
+
+
+async def _get_payment_settings(session: AsyncSession) -> PaymentSetting:
+    settings = (
+        await session.execute(
+            select(PaymentSetting).where(PaymentSetting.id == "default")
+        )
+    ).scalar_one_or_none()
+    if settings is None:
+        settings = PaymentSetting(id="default")
+        session.add(settings)
+        await session.commit()
+    return settings
+
+
+def _payment_channels(settings: PaymentSetting) -> list[str]:
+    try:
+        channels = json.loads(settings.enabled_channels or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [c for c in channels if isinstance(c, str)]
+
+
+@payment_router.get("/settings", summary="获取支付渠道配置")
+async def get_payment_settings(
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    settings = await _get_payment_settings(session)
+    data = settings.model_dump()
+    data["enabled_channels_list"] = _payment_channels(settings)
+    return data
+
+
+@payment_router.put("/settings", summary="更新支付渠道配置")
+async def update_payment_settings(
+    body: PaymentSettingsUpdate,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """api_key / callback_secret 传空字符串或缺省均表示保持原值（前端密钥框留空即可）。"""
+    settings = await _get_payment_settings(session)
+    data = body.model_dump(exclude_unset=True)
+
+    if data.get("gateway_base_url"):
+        settings.gateway_base_url = data["gateway_base_url"].strip().rstrip("/")
+    if data.get("api_key"):
+        settings.api_key = data["api_key"].strip()
+    if data.get("callback_secret"):
+        settings.callback_secret = data["callback_secret"].strip()
+    if "public_base_url" in data:
+        settings.public_base_url = (data["public_base_url"] or "").strip().rstrip("/")
+    if data.get("enabled_channels") is not None:
+        channels = [c for c in data["enabled_channels"] if c in ("wechat", "alipay")]
+        settings.enabled_channels = json.dumps(channels)
+    if data.get("enabled") is not None:
+        settings.enabled = data["enabled"]
+
+    settings.updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    session.add(settings)
+    await session.commit()
+    refreshed = await _get_payment_settings(session)
+    result = refreshed.model_dump()
+    result["enabled_channels_list"] = _payment_channels(refreshed)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 支付套餐 CRUD
+# ---------------------------------------------------------------------------
+
+
+async def _validate_package_group(session: AsyncSession, group_id: str | None) -> None:
+    if group_id:
+        group = (
+            await session.execute(
+                select(UserGroup).where(UserGroup.id == group_id)
+            )
+        ).scalar_one_or_none()
+        if group is None:
+            raise HTTPException(status_code=400, detail="指定的用户组不存在")
+
+
+@payment_router.get("/packages", summary="套餐列表")
+async def list_payment_packages(
+    session: AsyncSession = Depends(async_session_generator),
+    enabled_only: bool = False,
+) -> dict:
+    stmt = select(PaymentPackage).order_by(
+        PaymentPackage.sort_order.asc(), PaymentPackage.created_at.desc()
+    )
+    if enabled_only:
+        stmt = stmt.where(PaymentPackage.enabled == True)  # noqa: E712
+    result = await session.execute(stmt)
+    packages = list(result.scalars().all())
+    return {"data": [p.model_dump() for p in packages], "total": len(packages)}
+
+
+@payment_router.post("/packages", status_code=201, summary="创建套餐")
+async def create_payment_package(
+    body: PaymentPackageCreate,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    if body.amount_cny_cents <= 0:
+        raise HTTPException(status_code=400, detail="支付金额必须大于 0（单位：分）")
+    if body.credit_usd < 0:
+        raise HTTPException(status_code=400, detail="key 额度不能为负")
+    await _validate_package_group(session, body.group_id)
+    package = PaymentPackage(**body.model_dump())
+    session.add(package)
+    await session.commit()
+    await session.refresh(package)
+    return package.model_dump()
+
+
+@payment_router.patch("/packages/{package_id}", summary="更新套餐")
+async def update_payment_package(
+    package_id: str,
+    body: PaymentPackageUpdate,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    package = (
+        await session.execute(
+            select(PaymentPackage).where(PaymentPackage.id == package_id)
+        )
+    ).scalar_one_or_none()
+    if package is None:
+        raise HTTPException(status_code=404, detail="套餐不存在")
+    data = body.model_dump(exclude_unset=True)
+    if data.get("group_id"):
+        await _validate_package_group(session, data["group_id"])
+    for field, value in data.items():
+        setattr(package, field, value)
+    session.add(package)
+    await session.commit()
+    await session.refresh(package)
+    return package.model_dump()
+
+
+@payment_router.delete("/packages/{package_id}", summary="删除套餐")
+async def delete_payment_package(
+    package_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """删除套餐不影响已有订单（订单持有套餐快照，仍可正常发货）。"""
+    package = (
+        await session.execute(
+            select(PaymentPackage).where(PaymentPackage.id == package_id)
+        )
+    ).scalar_one_or_none()
+    if package is None:
+        raise HTTPException(status_code=404, detail="套餐不存在")
+    await session.delete(package)
+    await session.commit()
+    return {"deleted": package_id}
+
+
+# ---------------------------------------------------------------------------
+# 支付订单：集成下单 / 列表 / 查单（轮询） / 人工补单
+# ---------------------------------------------------------------------------
+
+# pending 订单超过该时长视为过期（网关侧订单同样超时作废）
+_PAYMENT_ORDER_TTL = timedelta(hours=2)
+# 实付与下单金额允许的偏差（分）：网关带 ±0.10 元防比价浮动
+_PAYMENT_AMOUNT_TOLERANCE_CENTS = 10
+
+
+class PaymentOrderCreateRequest(BaseModel):
+    package_id: str
+    channel: str  # "wechat" | "alipay"
+    username: str | None = None  # 可选购买者标记（铸出的 key 会绑定该用户）
+
+
+async def _expire_stale_pending_orders(session: AsyncSession) -> None:
+    """惰性过期：优先按网关返回的过期时间（约 5 分钟），缺失时兜底 2 小时。
+
+    ISO 字符串可直接按字典序比较。过期仅影响展示/轮询语义，不影响回调：
+    即使本地已标 expired，回调到达仍会正常发货（回调只看 credited_at 幂等标记）。
+    """
+    now = datetime.now(timezone.utc)
+    now_z = now.isoformat().replace("+00:00", "Z")
+    fallback_cutoff = (now - _PAYMENT_ORDER_TTL).isoformat().replace("+00:00", "Z")
+    await session.execute(
+        update(PaymentOrder)
+        .where(
+            PaymentOrder.status == "pending",
+            or_(
+                (PaymentOrder.gateway_expire_at.is_not(None))
+                & (PaymentOrder.gateway_expire_at < now_z),
+                (PaymentOrder.gateway_expire_at.is_(None))
+                & (PaymentOrder.created_at < fallback_cutoff),
+            ),
+        )
+        .values(status="expired")
+    )
+    await session.commit()
+
+
+@payment_router.post("/orders", summary="创建支付订单（外部软件集成下单）")
+async def create_payment_order(
+    body: PaymentOrderCreateRequest,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """按套餐下单：调用支付网关创建订单，返回支付入口（网关 data 原样透传）。
+
+    返回的 data.pay_amount 是用户实际需付金额（可能带 ±0.10 元浮动），
+    展示给用户的金额必须以它为准；支付链接/二维码字段同样在 data 里。
+    支付结果以回调发货，调用方轮询 `GET /admin/payment/orders/{order_id}` 取 key。
+    """
+    settings = await _get_payment_settings(session)
+    if not settings.enabled:
+        raise HTTPException(status_code=400, detail="支付功能未启用")
+    if not settings.api_key:
+        raise HTTPException(status_code=400, detail="支付渠道未配置 API Key")
+    if not settings.public_base_url:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置站点公网地址（public_base_url），无法生成回调地址",
+        )
+    enabled_channels = _payment_channels(settings)
+    if body.channel not in enabled_channels:
+        raise HTTPException(
+            status_code=400,
+            detail=f"支付方式 {body.channel} 未启用（可用：{enabled_channels}）",
+        )
+
+    package = (
+        await session.execute(
+            select(PaymentPackage).where(PaymentPackage.id == body.package_id)
+        )
+    ).scalar_one_or_none()
+    if package is None:
+        raise HTTPException(status_code=404, detail="套餐不存在")
+    if not package.enabled:
+        raise HTTPException(status_code=400, detail="套餐已下架")
+
+    biz_order_id = f"po-{uuid4().hex[:16]}"
+    notify_url = settings.public_base_url.rstrip("/") + "/payment/notify"
+    order = PaymentOrder(
+        biz_order_id=biz_order_id,
+        package_id=package.id,
+        package_label=package.label,
+        credit_usd=package.credit_usd,
+        duration_days=package.duration_days,
+        group_id=package.group_id,
+        channel=body.channel,
+        username=body.username or None,
+        amount_cny_cents=package.amount_cny_cents,
+        status="pending",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=not SKIP_SSL_VERIFY) as client:
+            resp = await client.post(
+                settings.gateway_base_url.rstrip("/") + "/api/v1/orders",
+                headers={
+                    "X-API-Key": settings.api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "biz_order_id": biz_order_id,
+                    "amount": package.amount_cny_cents,
+                    "notify_url": notify_url,
+                    "channel": body.channel,
+                },
+            )
+            resp.raise_for_status()
+            resp_json = resp.json()
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text[:200]
+        logger.warning(
+            f"支付网关下单失败 order={biz_order_id} "
+            f"status={e.response.status_code} body={detail}"
+        )
+        raise HTTPException(
+            status_code=502, detail=f"支付网关返回错误：{detail}"
+        )
+    except httpx.RequestError as e:
+        logger.warning(
+            f"支付网关连接失败 order={biz_order_id} err={e.__class__.__name__}: {e}"
+        )
+        raise HTTPException(
+            status_code=502, detail=f"支付网关连接失败：{e.__class__.__name__}"
+        )
+
+    data = resp_json.get("data") if isinstance(resp_json, dict) else None
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=502, detail=f"支付网关返回格式异常：{str(resp_json)[:200]}"
+        )
+
+    order.gateway_order_id = (
+        str(data.get("order_id") or data.get("id") or "") or None
+    )
+    expire_ms = data.get("expire_at")
+    if isinstance(expire_ms, (int, float)):
+        # 网关过期时间为 epoch 毫秒（实测下单后约 5 分钟）
+        order.gateway_expire_at = (
+            datetime.fromtimestamp(expire_ms / 1000, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+    order.pay_payload = json.dumps(data, ensure_ascii=False)
+    session.add(order)
+    await session.commit()
+
+    logger.info(
+        f"支付下单 order={biz_order_id} package={package.label} "
+        f"amount={package.amount_cny_cents}分 channel={body.channel}"
+    )
+    return {
+        "order_id": biz_order_id,
+        "amount_cny_cents": package.amount_cny_cents,
+        "pay_amount": data.get("pay_amount"),
+        "data": data,  # 网关返回原样透传（含支付链接/二维码），由调用方渲染
+    }
+
+
+@payment_router.get("/orders", summary="订单列表（分页+筛选）")
+async def list_payment_orders(
+    session: AsyncSession = Depends(async_session_generator),
+    page: int = 1,
+    page_size: int = 20,
+    status: str | None = None,
+    username: str | None = None,
+) -> dict:
+    await _expire_stale_pending_orders(session)
+
+    stmt = select(PaymentOrder)
+    if status:
+        stmt = stmt.where(PaymentOrder.status == status)
+    if username:
+        stmt = stmt.where(PaymentOrder.username.contains(username))
+
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.subquery()))
+    ).scalar() or 0
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
+    result = await session.execute(
+        stmt.order_by(PaymentOrder.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    orders = list(result.scalars().all())
+    return {
+        "data": [o.model_dump() for o in orders],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "has_more": (page - 1) * page_size + len(orders) < total,
+    }
+
+
+async def _get_order_by_biz_id(
+    session: AsyncSession, biz_order_id: str
+) -> PaymentOrder:
+    order = (
+        await session.execute(
+            select(PaymentOrder).where(PaymentOrder.biz_order_id == biz_order_id)
+        )
+    ).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(status_code=404, detail="订单不存在")
+    return order
+
+
+@payment_router.get("/orders/{biz_order_id}", summary="查单（轮询支付状态）")
+async def get_payment_order(
+    biz_order_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """外部软件轮询用：paid 且已发货后返回完整 sk- key。"""
+    order = await _get_order_by_biz_id(session, biz_order_id)
+    # 单条查询也做惰性过期，避免轮询到早已超时的订单一直 pending
+    if order.status == "pending":
+        now = datetime.now(timezone.utc)
+        now_z = now.isoformat().replace("+00:00", "Z")
+        fallback_cutoff = (now - _PAYMENT_ORDER_TTL).isoformat().replace("+00:00", "Z")
+        expired = (
+            order.gateway_expire_at is not None and order.gateway_expire_at < now_z
+        ) or (
+            order.gateway_expire_at is None and order.created_at < fallback_cutoff
+        )
+        if expired:
+            order.status = "expired"
+            session.add(order)
+            await session.commit()
+    data = order.model_dump()
+    data["key"] = await get_order_key(session, order)
+    return data
+
+
+@payment_router.get(
+    "/orders/{biz_order_id}/gateway-status",
+    summary="透传查询网关侧订单状态（对账/排障）",
+)
+async def get_payment_gateway_status(
+    biz_order_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """调用网关 GET /api/v1/orders/{gateway_order_id}，返回 data 原样透传。
+
+    含网关侧 status / paid_at / notified_at / expire_at，用于比对回调是否送达。
+    """
+    order = await _get_order_by_biz_id(session, biz_order_id)
+    settings = await _get_payment_settings(session)
+    if not order.gateway_order_id:
+        raise HTTPException(status_code=400, detail="订单缺少网关侧订单号")
+    if not settings.api_key:
+        raise HTTPException(status_code=400, detail="支付渠道未配置 API Key")
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=not SKIP_SSL_VERIFY) as client:
+            resp = await client.get(
+                f"{settings.gateway_base_url.rstrip('/')}/api/v1/orders/{order.gateway_order_id}",
+                headers={"X-API-Key": settings.api_key},
+            )
+            resp.raise_for_status()
+            resp_json = resp.json()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502, detail=f"支付网关返回错误：{e.response.text[:200]}"
+        )
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502, detail=f"支付网关连接失败：{e.__class__.__name__}"
+        )
+    return resp_json
+
+
+@payment_router.post(
+    "/orders/{biz_order_id}/mark-paid", summary="人工补单（跳过验签直接发货）"
+)
+async def mark_payment_order_paid(
+    biz_order_id: str,
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """回调丢失时的补救通道：手动确认收款并发货，幂等（已发货则直接返回 key）。"""
+    order = await _get_order_by_biz_id(session, biz_order_id)
+    already_credited = bool(order.credited_at)
+    await mark_order_paid_and_deliver(
+        session,
+        order,
+        pay_amount_cny_cents=order.pay_amount_cny_cents or order.amount_cny_cents,
+    )
+    await session.commit()
+    logger.warning(
+        f"人工补单 order={biz_order_id} already_credited={already_credited}"
+    )
+    return {
+        "ok": True,
+        "already_credited": already_credited,
+        "key": await get_order_key(session, order),
+        "order": order.model_dump(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 支付回调（公开，无鉴权：路径在 /v1/ 之外，不经过网关 AuthMiddleware）
+# ---------------------------------------------------------------------------
+
+public_payment_router = APIRouter(tags=["Payment: Public"])
+
+
+def _normalize_pay_cents(pay_amount: Any, order_cents: int) -> int | None:
+    """回调实付金额归一为分；无法解析或与下单金额偏差超容差返回 None。
+
+    网关协议金额单位为分，但为兼容以元下发的响应，按数值量级自动判别单位
+    （|v - amount| <= 容差 视为分；|v*100 - amount| <= 容差 视为元）。
+    """
+    try:
+        value = float(pay_amount)
+    except (TypeError, ValueError):
+        return None
+    if abs(value - order_cents) <= _PAYMENT_AMOUNT_TOLERANCE_CENTS:
+        return int(round(value))
+    if abs(value * 100 - order_cents) <= _PAYMENT_AMOUNT_TOLERANCE_CENTS:
+        return int(round(value * 100))
+    return None
+
+
+@public_payment_router.post("/payment/notify", summary="支付网关回调")
+async def payment_notify(
+    request: Request,
+    session: AsyncSession = Depends(async_session_generator),
+) -> Response:
+    """验签必须对原始请求体计算（不能先 JSON parse），比对 X-Signature 头。
+
+    - 幂等：同一订单重复回调只发货一次
+    - 金额容差 ±10 分（网关 ±0.10 元防比价浮动），超差标记 failed 并 400
+    - 2xx = 已接收；403 验签失败 / 404 订单不存在 / 400 格式或金额异常 /
+      500 发货失败（网关会重试）
+    """
+    raw = await request.body()
+    settings = await _get_payment_settings(session)
+    if not settings.callback_secret:
+        logger.warning("支付回调到达但未配置 callback_secret，拒绝")
+        return Response(status_code=403)
+
+    expected = base64.b64encode(
+        hmac.new(settings.callback_secret.encode(), raw, hashlib.sha256).digest()
+    ).decode()
+    signature = request.headers.get("X-Signature", "")
+    if not hmac.compare_digest(expected, signature):
+        logger.warning(f"支付回调验签失败 body={raw[:120]!r}")
+        return Response(status_code=403)
+
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return Response(status_code=400)
+    if not isinstance(payload, dict):
+        return Response(status_code=400)
+
+    biz_order_id = payload.get("biz_order_id")
+    order = None
+    if biz_order_id:
+        order = (
+            await session.execute(
+                select(PaymentOrder).where(
+                    PaymentOrder.biz_order_id == biz_order_id
+                )
+            )
+        ).scalar_one_or_none()
+    if order is None:
+        logger.warning(f"支付回调订单不存在 biz_order_id={biz_order_id}")
+        return Response(status_code=404)
+
+    if order.credited_at:
+        return Response(status_code=200)  # 幂等：已发货直接确认
+
+    pay_cents: int | None = None
+    if payload.get("pay_amount") is not None:
+        pay_cents = _normalize_pay_cents(payload["pay_amount"], order.amount_cny_cents)
+        if pay_cents is None:
+            logger.error(
+                f"支付回调金额异常 order={biz_order_id} "
+                f"下单={order.amount_cny_cents}分 实付={payload['pay_amount']!r}"
+            )
+            order.status = "failed"
+            session.add(order)
+            await session.commit()
+            return Response(status_code=400)
+
+    try:
+        await mark_order_paid_and_deliver(
+            session,
+            order,
+            pay_amount_cny_cents=pay_cents,
+            paid_at=str(payload["paid_at"]) if payload.get("paid_at") else None,
+        )
+        await session.commit()
+    except Exception as e:
+        logger.error(f"支付回调发货失败 order={biz_order_id}: {e}")
+        return Response(status_code=500)
+    return Response(status_code=200)

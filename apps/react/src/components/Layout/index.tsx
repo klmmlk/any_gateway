@@ -15,6 +15,7 @@ import {
   IconUser,
   IconTag,
   IconStorage,
+  IconQrcode,
   IconPoweroff,
 } from '@arco-design/web-react/icon'
 import { useAuthStore } from '../../store/auth'
@@ -30,6 +31,7 @@ const pageTitles: Record<string, string> = {
   channels: 'Channels',
   prices: 'Pricing',
   vouchers: 'Vouchers',
+  payment: 'Payment',
   users: 'User Management',
 }
 
@@ -66,6 +68,7 @@ const Layout: React.FC = () => {
     { key: 'channels', label: '渠道', icon: <IconSettings />, visible: isAdmin },
     { key: 'prices', label: '价格管理', icon: <IconStorage />, visible: isAdmin },
     { key: 'vouchers', label: '消费券', icon: <IconTag />, visible: isAdmin },
+    { key: 'payment', label: '支付', icon: <IconQrcode />, visible: isAdmin },
     { key: 'users', label: '用户管理', icon: <IconUser />, visible: isSuperAdmin },
   ]
 

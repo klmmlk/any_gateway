@@ -329,3 +329,89 @@ class GroupModelPriceUpdate(SQLModel):
     model_name: str | None = None
     unit: str | None = None
     price_per_unit: float | None = None
+
+
+# =======================
+# PaymentSetting（支付渠道配置，单行，id 固定 "default"）
+# =======================
+
+
+class PaymentSetting(SQLModel, table=True):
+    __tablename__ = "payment_settings"
+    id: str = Field(default="default", primary_key=True)
+    gateway_base_url: str = Field(default="https://pay.jokerin.icu")
+    # 明文存储（与 Channel.api_key 同一设计决策，待后期统一加密）
+    api_key: str = Field(default="")
+    callback_secret: str = Field(default="")
+    # 站点公网地址（https），用于拼接支付回调 notify_url，须公网可达
+    public_base_url: str = Field(default="")
+    # 启用的支付方式，JSON 数组字符串，如 '["wechat","alipay"]'
+    enabled_channels: str = Field(default='["wechat"]')
+    enabled: bool = Field(default=False)
+    created_at: str = Field(default_factory=utcnow)
+    updated_at: str | None = None
+
+
+# =======================
+# PaymentPackage（支付套餐：付款后按套餐发预付 key）
+# =======================
+
+
+class PaymentPackageBase(SQLModel):
+    label: str
+    amount_cny_cents: int  # 支付金额（人民币分）
+    credit_usd: float  # 发货 key 的额度（USD）
+    duration_days: int | None = None  # key 有效天数；None = 不限时
+    group_id: str | None = Field(default=None, foreign_key="user_groups.id")
+    enabled: bool = Field(default=True)
+    sort_order: int = Field(default=0)
+
+
+class PaymentPackage(PaymentPackageBase, table=True):
+    __tablename__ = "payment_packages"
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
+    created_at: str = Field(default_factory=utcnow)
+
+
+class PaymentPackageCreate(PaymentPackageBase):
+    pass
+
+
+class PaymentPackageUpdate(SQLModel):
+    label: str | None = None
+    amount_cny_cents: int | None = None
+    credit_usd: float | None = None
+    duration_days: int | None = None
+    group_id: str | None = None
+    enabled: bool | None = None
+    sort_order: int | None = None
+
+
+# =======================
+# PaymentOrder（支付订单，含套餐快照）
+# =======================
+
+
+class PaymentOrder(SQLModel, table=True):
+    __tablename__ = "payment_orders"
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
+    # 对外订单号（"po-" 前缀），传给支付网关的 biz_order_id，外部软件凭它查单
+    biz_order_id: str = Field(unique=True)
+    package_id: str | None = None
+    # 套餐快照：套餐事后修改/删除不影响已售订单的发货参数
+    package_label: str = ""
+    credit_usd: float = 0
+    duration_days: int | None = None
+    group_id: str | None = None
+    channel: str = ""  # "wechat" | "alipay"
+    username: str | None = None  # 可选购买者标记
+    amount_cny_cents: int = 0  # 下单金额（分）
+    pay_amount_cny_cents: int | None = None  # 实付金额（分），回调回填
+    status: str = Field(default="pending")  # "pending" | "paid" | "expired" | "failed"
+    gateway_order_id: str | None = None  # 网关侧订单号（若返回）
+    gateway_expire_at: str | None = None  # 网关订单过期时间（ISO，实测约下单后 5 分钟）
+    token_id: str | None = None  # 发货的 Token.id
+    pay_payload: str | None = None  # 网关创建订单返回 data 的 JSON 原文（支付入口透传给外部软件）
+    paid_at: str | None = None
+    credited_at: str | None = None  # 幂等标记：发货完成时间
+    created_at: str = Field(default_factory=utcnow)

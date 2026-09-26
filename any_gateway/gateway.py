@@ -28,7 +28,7 @@ from services.responses_converter import (
     _ResponsesStreamState,
 )
 from services.auth_service import require_auth, optional_require_auth
-from admin.router import token_router, channel_router, group_router, admin_router, auth_router, me_router, users_router, user_router, group_channel_router, user_group_router, rate_limit_router, model_price_router, group_model_price_router, voucher_router, public_voucher_router, public_key_router
+from admin.router import token_router, channel_router, group_router, admin_router, auth_router, me_router, users_router, user_router, group_channel_router, user_group_router, rate_limit_router, model_price_router, group_model_price_router, voucher_router, public_voucher_router, public_key_router, payment_router, public_payment_router
 import yaml
 import json
 import time
@@ -113,6 +113,9 @@ app.include_router(group_model_price_router)
 app.include_router(voucher_router)
 app.include_router(public_voucher_router)
 app.include_router(public_key_router)
+# 支付：/admin/payment/*（配置/套餐/订单，需 admin 鉴权）+ 公开回调 /payment/notify
+app.include_router(payment_router)
+app.include_router(public_payment_router)
 
 
 @app.get("/public/model-prices", tags=["Public"])
