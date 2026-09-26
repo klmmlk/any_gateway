@@ -19,6 +19,7 @@ services:
     build: .
     ports:
       - "${GATEWAY_PORT:-8003}:8003"
+      - "8443:8443"   # 内置 Caddy 的 HTTPS（需配置 ACME_DOMAIN + CLOUDFLARE_API_TOKEN，见 docs/https-deployment.md）
     volumes:
       - ./data:/app/data
     environment:
@@ -31,6 +32,8 @@ services:
       - SUPERADMIN_USERNAME=${SUPERADMIN_USERNAME:-superadmin}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - SKIP_SSL_VERIFY=${SKIP_SSL_VERIFY:-0}
+      - ACME_DOMAIN=${ACME_DOMAIN:-}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
     depends_on:
       - redis
     restart: unless-stopped
@@ -40,25 +43,6 @@ services:
       timeout: 10s
       start_period: 15s
       retries: 3
-
-  # HTTPS 反向代理 + ACME 自动证书（DNS-01 验证，不依赖入站 80/443）
-  # 需在 .env 配置 ACME_DOMAIN 与 CLOUDFLARE_API_TOKEN，用法见 docs/https-deployment.md
-  caddy:
-    build:
-      context: .
-      dockerfile: Dockerfile.caddy
-    container_name: any-gateway-caddy
-    ports:
-      - "8443:8443"
-    environment:
-      - ACME_DOMAIN=${ACME_DOMAIN}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./data/caddy:/data
-    depends_on:
-      - gateway
-    restart: unless-stopped
 
 volumes:
   redis_data:

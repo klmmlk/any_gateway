@@ -1,27 +1,17 @@
-# 反向代理 + ACME 自动证书（DNS-01 验证）
+# 内置 HTTPS 反向代理（本文件烘在 gateway 镜像内，由 docker-entrypoint.sh 在
+# 容器配置了 ACME_DOMAIN 与 CLOUDFLARE_API_TOKEN 环境变量时启动）。
 #
-# 用法：在 .env 中配置 ACME_DOMAIN（如 gw.example.com）和 CLOUDFLARE_API_TOKEN
-# 后 `docker compose up -d caddy`。证书向 Let's Encrypt/ZeroSSL 自动申请，
-# 到期前自动续期，证书数据持久化在 ./data/caddy。
-#
-# 验证方式为 DNS-01（Cloudflare API 加/删 TXT 记录），不需要任何入站端口，
-# 因此 80/443 被运营商封锁也不影响签发与续期。
-# HTTPS 监听 8443（Cloudflare 代理兼容端口，将来切橙云无需改动）。
+# 证书验证方式为 DNS-01（通过 Cloudflare API 加/删 _acme-challenge TXT 记录），
+# 不依赖任何入站端口，80/443 被运营商封锁也不影响签发与续期。
+# 证书数据存 /app/data/caddy（宿主机 ./data/caddy），重建容器不重签。
 
 https://{$ACME_DOMAIN}:8443 {
-	reverse_proxy gateway:8003 {
+	reverse_proxy 127.0.0.1:8003 {
 		# LLM 流式响应（SSE）逐块透传，不做缓冲
 		flush_interval -1
 	}
 
 	tls {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
-	}
-
-	log {
-		output file /data/access.log {
-			roll_size 10MiB
-			roll_keep 5
-		}
 	}
 }

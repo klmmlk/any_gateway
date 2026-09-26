@@ -1,0 +1,5 @@
+# Docker 构建上下文里的脚本/配置必须保持 LF，否则 Windows 上本地构建会因 CRLF 报错
+*.sh text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+Caddyfile text eol=lf

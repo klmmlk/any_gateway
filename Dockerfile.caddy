@@ -1,8 +1,0 @@
-# Caddy + Cloudflare DNS 插件自定义构建
-# 官方 caddy 镜像不含任何 DNS 供应商插件，DNS-01 验证（证书申请/续期走 Cloudflare API，
-# 不依赖入站端口）必须用 xcaddy 构建带插件的二进制。
-FROM caddy:2-builder AS builder
-RUN xcaddy build --with github.com/caddy-dns/cloudflare
-
-FROM caddy:2-alpine
-COPY --from=builder /usr/bin/caddy /usr/bin/caddy
