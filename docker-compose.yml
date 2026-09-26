@@ -41,5 +41,24 @@ services:
       start_period: 15s
       retries: 3
 
+  # HTTPS 反向代理 + ACME 自动证书（DNS-01 验证，不依赖入站 80/443）
+  # 需在 .env 配置 ACME_DOMAIN 与 CLOUDFLARE_API_TOKEN，用法见 docs/https-deployment.md
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    container_name: any-gateway-caddy
+    ports:
+      - "8443:8443"
+    environment:
+      - ACME_DOMAIN=${ACME_DOMAIN}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
 volumes:
   redis_data:
