@@ -110,6 +110,15 @@ async def init_db():
         except Exception:
             pass
 
+    # payment_packages 表的套餐分组（外部应用按分组名拉取套餐列表，幂等自动加列）
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(
+                "ALTER TABLE payment_packages ADD COLUMN group_name VARCHAR"
+            ))
+        except Exception:
+            pass
+
     # 确保 default 分组存在（幂等）
     from db.models import UserGroup
     async with AsyncSession(engine, expire_on_commit=False) as session:

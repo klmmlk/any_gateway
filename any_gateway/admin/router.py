@@ -2346,15 +2346,32 @@ async def _validate_package_group(session: AsyncSession, group_id: str | None) -
 async def list_payment_packages(
     session: AsyncSession = Depends(async_session_generator),
     enabled_only: bool = False,
+    group: str | None = None,  # 按套餐分组名过滤（外部应用拉取某分组的上架套餐）
 ) -> dict:
     stmt = select(PaymentPackage).order_by(
         PaymentPackage.sort_order.asc(), PaymentPackage.created_at.desc()
     )
     if enabled_only:
         stmt = stmt.where(PaymentPackage.enabled == True)  # noqa: E712
+    if group:
+        stmt = stmt.where(PaymentPackage.group_name == group.strip())
     result = await session.execute(stmt)
     packages = list(result.scalars().all())
     return {"data": [p.model_dump() for p in packages], "total": len(packages)}
+
+
+@payment_router.get("/package-groups", summary="套餐分组列表（去重）")
+async def list_payment_package_groups(
+    session: AsyncSession = Depends(async_session_generator),
+) -> dict:
+    """所有套餐出现过的分组名（面板下拉建议 + 外部应用发现分组）。"""
+    result = await session.execute(
+        select(PaymentPackage.group_name)
+        .where(PaymentPackage.group_name.is_not(None), PaymentPackage.group_name != "")
+        .distinct()
+        .order_by(PaymentPackage.group_name)
+    )
+    return {"data": [row[0] for row in result.all()]}
 
 
 @payment_router.post("/packages", status_code=201, summary="创建套餐")
@@ -2367,6 +2384,8 @@ async def create_payment_package(
     if body.credit_usd < 0:
         raise HTTPException(status_code=400, detail="key 额度不能为负")
     await _validate_package_group(session, body.group_id)
+    if body.group_name is not None:
+        body.group_name = body.group_name.strip() or None
     package = PaymentPackage(**body.model_dump())
     session.add(package)
     await session.commit()
@@ -2390,6 +2409,8 @@ async def update_payment_package(
     data = body.model_dump(exclude_unset=True)
     if data.get("group_id"):
         await _validate_package_group(session, data["group_id"])
+    if "group_name" in data and data["group_name"] is not None:
+        data["group_name"] = data["group_name"].strip() or None
     for field, value in data.items():
         setattr(package, field, value)
     session.add(package)

@@ -363,6 +363,8 @@ class PaymentPackageBase(SQLModel):
     credit_usd: float  # 发货 key 的额度（USD）
     duration_days: int | None = None  # key 有效天数；None = 不限时
     group_id: str | None = Field(default=None, foreign_key="user_groups.id")
+    # 套餐分组（如 "应用1"）：外部应用按分组名拉取上架套餐列表，与 group_id（key 绑定的路由分组）无关
+    group_name: str | None = None
     enabled: bool = Field(default=True)
     sort_order: int = Field(default=0)
 
@@ -383,6 +385,7 @@ class PaymentPackageUpdate(SQLModel):
     credit_usd: float | None = None
     duration_days: int | None = None
     group_id: str | None = None
+    group_name: str | None = None
     enabled: bool | None = None
     sort_order: int | None = None
 

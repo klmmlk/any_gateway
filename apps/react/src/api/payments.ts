@@ -29,6 +29,7 @@ export interface PaymentPackage {
   credit_usd: number
   duration_days: number | null
   group_id: string | null
+  group_name: string | null
   enabled: boolean
   sort_order: number
   created_at: string
@@ -40,6 +41,7 @@ export interface PaymentPackagePayload {
   credit_usd: number
   duration_days?: number | null
   group_id?: string | null
+  group_name?: string | null
   enabled?: boolean
   sort_order?: number
 }
@@ -80,8 +82,11 @@ export const updatePaymentSettings = (data: PaymentSettingsUpdate) =>
   client.put('/admin/payment/settings', data)
 
 // 套餐
-export const getPaymentPackages = () =>
-  client.get('/admin/payment/packages')
+export const getPaymentPackages = (params?: { enabled_only?: boolean; group?: string }) =>
+  client.get('/admin/payment/packages', { params })
+
+export const getPaymentPackageGroups = () =>
+  client.get('/admin/payment/package-groups')
 
 export const createPaymentPackage = (data: PaymentPackagePayload) =>
   client.post('/admin/payment/packages', data)

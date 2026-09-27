@@ -52,8 +52,23 @@ GET /admin/payment/packages?enabled_only=true
 ```json
 {"data": [{"id": "a6314d98...", "label": "周卡", "amount_cny_cents": 990,
            "credit_usd": 1, "duration_days": 7, "group_id": null,
+           "group_name": "应用1",
            "enabled": true, "sort_order": 1}], "total": 1}
 ```
+
+**按套餐分组拉取**：面板建套餐时可填「套餐分组」（如 `应用1`），你的应用传 `group` 参数即可取到该分组下所有上架套餐——一个应用只展示自己的套餐：
+
+```
+GET /admin/payment/packages?enabled_only=true&group=应用1
+```
+
+发现有哪些分组：
+
+```
+GET /admin/payment/package-groups   →  {"data": ["应用1", "应用2"]}
+```
+
+> 注意两个字段的区别：`group_name`（套餐分组）只用于**分组展示/拉取列表**；`group_id`（用户组）决定发出 key 的渠道路由/限流/计价倍率，互不影响。
 
 ### 3.2 下单
 

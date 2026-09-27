@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Table, Button, Modal, Form, Input, InputNumber, Switch, Tabs,
-  Popconfirm, Message, Typography, Tag, Select, Checkbox,
+  Popconfirm, Message, Typography, Tag, Select, Checkbox, AutoComplete,
 } from '@arco-design/web-react'
 import { IconPlus, IconRefresh, IconSave } from '@arco-design/web-react/icon'
 import {
   getPaymentSettings, updatePaymentSettings,
   getPaymentPackages, createPaymentPackage, updatePaymentPackage, deletePaymentPackage,
-  getPaymentOrders, markPaymentOrderPaid,
+  getPaymentPackageGroups, getPaymentOrders, markPaymentOrderPaid,
 } from '../../api/payments'
 import type { PaymentPackage, PaymentPackagePayload } from '../../api/payments'
 import { getGroups } from '../../api/groups'
@@ -184,6 +184,7 @@ const PackagesTab: React.FC = () => {
   const [visible, setVisible] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [editing, setEditing] = useState<PaymentPackage | null>(null)
+  const [pkgGroups, setPkgGroups] = useState<string[]>([])
   const [form] = Form.useForm()
   const { groups, groupName } = useGroups()
 
@@ -200,7 +201,17 @@ const PackagesTab: React.FC = () => {
     }
   }, [])
 
+  const fetchGroups = useCallback(async () => {
+    try {
+      const res = await getPaymentPackageGroups()
+      setPkgGroups(res.data?.data ?? [])
+    } catch {
+      /* 分组建议仅辅助输入，失败不提示 */
+    }
+  }, [])
+
   useEffect(() => { fetchData() }, [fetchData])
+  useEffect(() => { fetchGroups() }, [fetchGroups])
 
   const openCreate = () => {
     setEditing(null)
@@ -218,6 +229,7 @@ const PackagesTab: React.FC = () => {
       credit_usd: row.credit_usd,
       duration_days: row.duration_days,
       group_id: row.group_id,
+      group_name: row.group_name ?? '',
       sort_order: row.sort_order,
       enabled: row.enabled,
     })
@@ -233,6 +245,7 @@ const PackagesTab: React.FC = () => {
         credit_usd: values.credit_usd ?? 0,
         duration_days: values.duration_days ?? null,
         group_id: values.group_id ?? null,
+        group_name: (values.group_name ?? '').trim() || null,
         sort_order: values.sort_order ?? 0,
         enabled: values.enabled ?? true,
       }
@@ -245,6 +258,7 @@ const PackagesTab: React.FC = () => {
       }
       setVisible(false)
       fetchData()
+      fetchGroups()
     } catch {
       Message.error(editing ? '更新失败' : '创建失败')
     } finally {
@@ -300,6 +314,12 @@ const PackagesTab: React.FC = () => {
       dataIndex: 'duration_days',
       render: (v: number | null) =>
         v ? <Tag color="arcoblue">{v} 天</Tag> : <span style={{ color: 'var(--ag-outline)' }}>不限时</span>,
+    },
+    {
+      title: '套餐分组',
+      dataIndex: 'group_name',
+      render: (v: string | null) =>
+        v ? <Tag color="orange">{v}</Tag> : <span style={{ color: 'var(--ag-outline)' }}>—</span>,
     },
     {
       title: '分组',
@@ -376,6 +396,13 @@ const PackagesTab: React.FC = () => {
               placeholder="default（默认）"
               options={groups.map((g) => ({ label: g.name, value: g.id }))}
             />
+          </Form.Item>
+          <Form.Item
+            label="套餐分组（选填）"
+            field="group_name"
+            extra="外部应用按此分组名拉取上架套餐列表（如：应用1）；与上面的用户组无关"
+          >
+            <AutoComplete placeholder="如：应用1" data={pkgGroups} allowClear />
           </Form.Item>
           <Form.Item label="排序（小者在前）" field="sort_order" initialValue={0}>
             <InputNumber min={0} precision={0} style={{ width: '100%' }} />
