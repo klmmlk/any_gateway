@@ -149,7 +149,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not path.startswith(self.AUTH_PREFIXES):
             return await call_next(request)
 
-        if path in self.AUTH_OPTIONAL_KEY_PATHS:
+        # /v1/models 及其子路径（单模型查询 /v1/models/{id}）为可选 Key + 可选 JWT 的元信息端点
+        if path in self.AUTH_OPTIONAL_KEY_PATHS or path.startswith("/v1/models/"):
             api_key = self._extract_key(request.headers)
             if api_key:
                 token, error_msg, status_code = await self._validate_key(api_key)

@@ -1088,6 +1088,104 @@ def test_models_filtered_by_token_group(client):
     assert "model-only-in-b" not in model_ids
 
 
+def test_models_passthrough_tts_voices(client):
+    """Channel.models 条目里的 voices 应透传到 /v1/models，别名继承映射目标模型的 voices，无 voices 的条目不带该键。"""
+    import json as _json
+
+    ADMIN_HEADERS = {"x-admin-key": "test-admin-secret"}
+
+    client.post("/admin/groups", json={"name": "voices-group"}, headers=ADMIN_HEADERS)
+    groups_resp = client.get("/admin/groups", headers=ADMIN_HEADERS).json()
+    grp = next(g for g in groups_resp["data"] if g["name"] == "voices-group")
+
+    voices = ["Cherry", "Serena", "Ethan"]
+    client.post("/admin/channels", json={
+        "name": "ch-tts-voices",
+        "provider": "openai",
+        "base_url": "http://fake-tts/v1",
+        "api_key": "fake-tts",
+        "models": _json.dumps([
+            {"id": "FunAudioLLM/CosyVoice2-0.5B", "voices": voices},
+            {"id": "cosyvoice-v2", "voices": [{"voice": "Cherry", "desc": "阳光积极、亲切自然小姐姐（女性）"}]},
+            "plain-model",
+        ]),
+        "model_mapping": _json.dumps({"cosyvoice2": "FunAudioLLM/CosyVoice2-0.5B"}),
+        "enabled": True,
+        "weight": 1,
+    }, headers=ADMIN_HEADERS)
+    channels_resp = client.get("/admin/channels", headers=ADMIN_HEADERS).json()
+    ch = next(c for c in channels_resp["data"] if c["name"] == "ch-tts-voices")
+    client.post(f"/admin/groups/{grp['id']}/channels/{ch['id']}", headers=ADMIN_HEADERS)
+
+    login = client.post("/admin/auth/login", json={"username": "_admin_fallback", "password": os.environ["ADMIN_FALLBACK_KEY"]})
+    jwt = login.json()["access_token"]
+    tok = client.post("/user/tokens", json={"name": "voices-token", "group_id": grp["id"]}, headers={"Authorization": f"Bearer {jwt}"}).json()
+    api_key = tok["key"]
+
+    res = client.get("/v1/models", headers={"x-api-key": api_key})
+    assert res.status_code == 200
+    by_id = {m["id"]: m for m in res.json()["data"]}
+
+    assert by_id["FunAudioLLM/CosyVoice2-0.5B"]["voices"] == voices
+    assert by_id["cosyvoice2"]["voices"] == voices
+    # 对象格式（带说明）同样原样透传
+    assert by_id["cosyvoice-v2"]["voices"] == [{"voice": "Cherry", "desc": "阳光积极、亲切自然小姐姐（女性）"}]
+    assert "voices" not in by_id["plain-model"]
+
+
+def test_model_info_endpoint_returns_single_model(client):
+    """GET /v1/models/{model_id} 返回单模型条目：原名（含斜杠）带 voices、别名继承、未知 404、无认证 401。"""
+    import json as _json
+
+    ADMIN_HEADERS = {"x-admin-key": "test-admin-secret"}
+
+    client.post("/admin/groups", json={"name": "model-info-group"}, headers=ADMIN_HEADERS)
+    groups_resp = client.get("/admin/groups", headers=ADMIN_HEADERS).json()
+    grp = next(g for g in groups_resp["data"] if g["name"] == "model-info-group")
+
+    voices = [{"voice": "v1", "desc": "d1"}]
+    client.post("/admin/channels", json={
+        "name": "ch-model-info",
+        "provider": "openai",
+        "base_url": "http://fake-info/v1",
+        "api_key": "fake-info",
+        "models": _json.dumps([
+            {"id": "demo-tts/unique-model-info", "voices": voices},
+        ]),
+        "model_mapping": _json.dumps({"unique-alias": "demo-tts/unique-model-info"}),
+        "enabled": True,
+        "weight": 1,
+    }, headers=ADMIN_HEADERS)
+    channels_resp = client.get("/admin/channels", headers=ADMIN_HEADERS).json()
+    ch = next(c for c in channels_resp["data"] if c["name"] == "ch-model-info")
+    client.post(f"/admin/groups/{grp['id']}/channels/{ch['id']}", headers=ADMIN_HEADERS)
+
+    login = client.post("/admin/auth/login", json={"username": "_admin_fallback", "password": os.environ["ADMIN_FALLBACK_KEY"]})
+    jwt = login.json()["access_token"]
+    tok = client.post("/user/tokens", json={"name": "model-info-token", "group_id": grp["id"]}, headers={"Authorization": f"Bearer {jwt}"}).json()
+    api_key = tok["key"]
+
+    # 原名：含斜杠的模型 id 直接写路径
+    res = client.get("/v1/models/demo-tts/unique-model-info", headers={"x-api-key": api_key})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["id"] == "demo-tts/unique-model-info"
+    assert body["voices"] == voices
+
+    # 别名继承音色
+    res = client.get("/v1/models/unique-alias", headers={"x-api-key": api_key})
+    assert res.status_code == 200
+    assert res.json()["voices"] == voices
+
+    # 未知模型 404
+    res = client.get("/v1/models/definitely-not-exist-xyz", headers={"x-api-key": api_key})
+    assert res.status_code == 404
+
+    # 无认证 401
+    res = client.get("/v1/models/unique-alias")
+    assert res.status_code == 401
+
+
 def test_bound_group_token_works_immediately_after_channel_update(client):
     """更新 channel 后，已绑定 group 的 API Key 无需重新选择 group 也应立即生效。"""
     import json as _json
@@ -1226,6 +1324,71 @@ def test_fetch_channel_models_keeps_more_than_500_models(client):
     body = res.json()
     assert body["count"] == 600
     assert len(body["models"]) == 600
+
+
+def test_fetch_channel_models_preserves_existing_voices(client):
+    """fetch-models 全量覆盖时，应按模型 id 保留库里手工维护的 voices（TTS 音色列表）。"""
+    import json as _json
+    from unittest.mock import patch
+
+    admin_headers = {"x-admin-key": "test-admin-secret"}
+
+    client.post(
+        "/admin/channels",
+        json={
+            "name": "fetch-models-keep-voices",
+            "provider": "openai",
+            "base_url": "https://example.com/v1",
+            "api_key": "fake-key",
+            "models": _json.dumps([
+                {"id": "tts-model", "voices": ["Cherry", "Serena"]},
+                {"id": "text-model"},
+            ]),
+            "enabled": True,
+            "weight": 1,
+        },
+        headers=admin_headers,
+    )
+    channels_resp = client.get("/admin/channels", headers=admin_headers).json()
+    channel = next(c for c in channels_resp["data"] if c["name"] == "fetch-models-keep-voices")
+
+    fake_models = [{"id": "tts-model", "object": "model"}, {"id": "text-model", "object": "model"}, {"id": "new-model", "object": "model"}]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"data": fake_models}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None):
+            return FakeResponse()
+
+    with patch("admin.router.httpx.AsyncClient", FakeAsyncClient):
+        res = client.post(
+            f"/admin/channels/{channel['id']}/fetch-models",
+            headers=admin_headers,
+        )
+
+    assert res.status_code == 200
+    assert res.json()["count"] == 3
+
+    channels_resp = client.get("/admin/channels", headers=admin_headers).json()
+    saved = _json.loads(next(c for c in channels_resp["data"] if c["name"] == "fetch-models-keep-voices")["models"])
+    by_id = {m["id"]: m for m in saved}
+    assert by_id["tts-model"]["voices"] == ["Cherry", "Serena"]
+    assert "voices" not in by_id["text-model"]
+    assert "voices" not in by_id["new-model"]
 
 
 def test_get_channel_upstream_models_readonly(client):

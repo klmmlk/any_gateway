@@ -89,6 +89,44 @@ function parseMappings(model_mapping: string | null): Mapping[] {
   }
 }
 
+interface VoiceEntry {
+  voice: string
+  desc: string
+}
+
+// 解析 models JSON：返回原始条目（保留未知扩展字段）+ 各模型音色（键存在 = 标记为 TTS）。
+// 兼容旧格式：voices 元素为纯字符串时转成 {voice, desc: ''}
+function parseModelsDetail(models: string | null): {
+  entries: Array<string | Record<string, unknown>>
+  voices: Record<string, VoiceEntry[]>
+} {
+  let entries: Array<string | Record<string, unknown>> = []
+  try {
+    const list = JSON.parse(models || '[]')
+    if (Array.isArray(list)) entries = list
+  } catch {
+    // noop
+  }
+  const voices: Record<string, VoiceEntry[]> = {}
+  for (const e of entries) {
+    if (e && typeof e === 'object' && Array.isArray((e as { voices?: unknown }).voices)) {
+      const id = String((e as { id?: unknown }).id ?? (e as { name?: unknown }).name ?? '')
+      if (!id) continue
+      voices[id] = (e as { voices: unknown[] }).voices
+        .map((v) =>
+          typeof v === 'string'
+            ? { voice: v, desc: '' }
+            : {
+                voice: String((v as { voice?: unknown }).voice ?? ''),
+                desc: String((v as { desc?: unknown }).desc ?? ''),
+              },
+        )
+        .filter((v) => v.voice)
+    }
+  }
+  return { entries, voices }
+}
+
 const Channels: React.FC = () => {
   const [data, setData] = useState<Channel[]>([])
   const [loading, setLoading] = useState(false)
@@ -107,6 +145,13 @@ const Channels: React.FC = () => {
   // 每渠道缓存上游候选：打开弹窗直接复用，仅 ⟳ 按钮强制重新拉取
   const [upstreamCache, setUpstreamCache] = useState<Record<string, string[]>>({})
   const upstreamFetchSeq = useRef(0)
+  // TTS 音色草稿：键存在 = 标记为 TTS；值 = 音色列表（允许空数组 = 标记了还没配音色）
+  const [modelVoices, setModelVoices] = useState<Record<string, VoiceEntry[]>>({})
+  // 打开弹窗时的原始 models 条目，保存时未标记 TTS 的条目原样保留（不丢未知扩展字段）
+  const [originalEntries, setOriginalEntries] = useState<Array<string | Record<string, unknown>>>([])
+  // 音色编辑二级弹窗（单个 JSON 输入框）
+  const [voiceEditorModel, setVoiceEditorModel] = useState<string | null>(null)
+  const [voiceDraftText, setVoiceDraftText] = useState('')
 
   // 弹窗内派生值：候选 / 自定义（不在候选中的已选，含映射别名）/ 搜索过滤结果
   const upstreamList = upstreamIds ?? []
@@ -272,7 +317,11 @@ const Channels: React.FC = () => {
 
   const openManageModels = (channel: Channel) => {
     setManagingChannel(channel)
-    setSelectedModels(parseModelIds(channel.models, channel.model_mapping))
+    // 仅勾选真实模型条目；映射别名只在编辑抽屉管理，不进弹窗、不写回 models
+    setSelectedModels(parseModelIds(channel.models, null))
+    const detail = parseModelsDetail(channel.models)
+    setOriginalEntries(detail.entries)
+    setModelVoices(detail.voices)
     setModelSearch('')
     setManualModel('')
     const cached = upstreamCache[channel.id]
@@ -328,25 +377,106 @@ const Channels: React.FC = () => {
     setManualModel('')
   }
 
+  // TTS 勾选即 voices 键的存在性：勾选创建（允许空数组），取消删除（有数据时二次确认）
+  const toggleTtsModel = (id: string, checked: boolean) => {
+    if (checked) {
+      setModelVoices((prev) => (prev[id] ? prev : { ...prev, [id]: [] }))
+      return
+    }
+    const count = modelVoices[id]?.length ?? 0
+    const remove = () => {
+      setModelVoices((prev) => {
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+    }
+    if (count > 0) {
+      Modal.confirm({
+        title: '取消 TTS 标记',
+        content: `该模型已配置 ${count} 个音色，取消勾选将一并删除，确定？`,
+        okText: '删除',
+        cancelText: '取消',
+        onOk: remove,
+      })
+    } else {
+      remove()
+    }
+  }
+
+  const openVoiceEditor = (id: string) => {
+    setVoiceEditorModel(id)
+    setVoiceDraftText(voicesToEditorText(modelVoices[id] ?? []))
+  }
+
+  // 编辑框用「音色名 → 说明」的键值对格式，写起来最省事；存储与 /v1/models 仍是 [{voice, desc}] 数组
+  const voicesToEditorText = (voices: VoiceEntry[]): string =>
+    JSON.stringify(Object.fromEntries(voices.map((v) => [v.voice, v.desc])), null, 2)
+
+  const parseVoicesJson = (text: string): VoiceEntry[] | string => {
+    let obj: unknown
+    try {
+      obj = JSON.parse(text)
+    } catch (e) {
+      return 'JSON 语法错误：' + (e instanceof Error ? e.message : String(e))
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return '必须是一个 JSON 对象：键为音色名，值为说明'
+    }
+    const out: VoiceEntry[] = []
+    for (const [rawKey, value] of Object.entries(obj as Record<string, unknown>)) {
+      const voice = rawKey.trim()
+      if (!voice) return '存在空的音色名（键）'
+      if (value !== null && value !== undefined && typeof value !== 'string') {
+        return `音色 ${voice} 的说明必须是字符串`
+      }
+      out.push({ voice, desc: typeof value === 'string' ? value.trim() : '' })
+    }
+    const names = out.map((v) => v.voice)
+    if (new Set(names).size !== names.length) return '存在重复的音色名（首尾空格会被忽略）'
+    return out
+  }
+
+  const saveVoiceEditor = () => {
+    if (!voiceEditorModel) return
+    const parsed = parseVoicesJson(voiceDraftText)
+    if (typeof parsed === 'string') {
+      Message.error(parsed)
+      return
+    }
+    setModelVoices((prev) => ({ ...prev, [voiceEditorModel]: parsed }))
+    setVoiceEditorModel(null)
+  }
+
   const handleSaveModels = async () => {
     if (!managingChannel) return
     const ids = Array.from(new Set(selectedModels.map((s) => s.trim()).filter(Boolean)))
     setSavingModels(true)
     try {
-      // 同步清理 model_mapping 中已不在选中集内的 key（沿用原删除语义）
-      let mappingObj: Record<string, string> = {}
-      try {
-        mappingObj = JSON.parse(managingChannel.model_mapping || '{}')
-      } catch {
-        // noop
+      // 条目重建：标记了 TTS 的模型存 {id, voices}（空数组也保留标记），其余条目原样保留。
+      // model_mapping 不在本弹窗触碰——别名只在编辑抽屉里增删。
+      const entryById = new Map<string, string | Record<string, unknown>>()
+      for (const e of originalEntries) {
+        const eid =
+          typeof e === 'string'
+            ? e
+            : String((e as { id?: unknown }).id ?? (e as { name?: unknown }).name ?? '')
+        if (eid) entryById.set(eid, e)
       }
-      parseMappingKeys(managingChannel.model_mapping).forEach((key) => {
-        if (!ids.includes(key)) delete mappingObj[key]
+      const modelsPayload = ids.map((id) => {
+        const original = entryById.get(id)
+        if (!(id in modelVoices)) {
+          return original ?? id
+        }
+        return {
+          ...(original && typeof original === 'object' ? original : {}),
+          id,
+          voices: modelVoices[id],
+        }
       })
 
       await updateChannel(managingChannel.id, {
-        models: JSON.stringify(ids),
-        model_mapping: JSON.stringify(mappingObj),
+        models: JSON.stringify(modelsPayload),
       })
       Message.success(`已保存 ${ids.length} 个模型`)
       setManagingChannel(null)
@@ -605,6 +735,9 @@ const Channels: React.FC = () => {
             <>
               {[...visibleCustom, ...visibleUpstream].map((id) => {
                 const isCustom = customIds.includes(id)
+                const isSelected = selectedModels.includes(id)
+                const isTts = id in modelVoices
+                const voiceCount = modelVoices[id]?.length ?? 0
                 return (
                   <div
                     key={id}
@@ -615,9 +748,9 @@ const Channels: React.FC = () => {
                       padding: '5px 12px',
                       cursor: 'pointer',
                     }}
-                    onClick={() => toggleModel(id, !selectedModels.includes(id))}
+                    onClick={() => toggleModel(id, !isSelected)}
                   >
-                    <Checkbox checked={selectedModels.includes(id)} />
+                    <Checkbox checked={isSelected} />
                     <span
                       style={{
                         flex: 1,
@@ -640,12 +773,63 @@ const Channels: React.FC = () => {
                         手动
                       </Tag>
                     )}
+                    {isSelected && (
+                      <span
+                        style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <Checkbox checked={isTts} onChange={(checked) => toggleTtsModel(id, checked)} />
+                        <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+                          TTS
+                        </Typography.Text>
+                        {isTts && (
+                          <>
+                            <Tag color={voiceCount > 0 ? 'green' : 'gray'} style={{ fontSize: 11, marginBottom: 0 }}>
+                              {voiceCount > 0 ? `音色 ×${voiceCount}` : '未配音色'}
+                            </Tag>
+                            <Button size="mini" type="text" onClick={() => openVoiceEditor(id)}>
+                              配置
+                            </Button>
+                          </>
+                        )}
+                      </span>
+                    )}
                   </div>
                 )
               })}
             </>
           )}
         </div>
+      </Modal>
+
+      {/* 音色编辑二级弹窗 */}
+      <Modal
+        title={`${voiceEditorModel ?? ''} — 音色配置`}
+        visible={!!voiceEditorModel}
+        onCancel={() => setVoiceEditorModel(null)}
+        footer={
+          <Space>
+            <Button onClick={() => setVoiceEditorModel(null)}>取消</Button>
+            <Button type="primary" onClick={saveVoiceEditor}>
+              确定
+            </Button>
+          </Space>
+        }
+        style={{ width: 600, maxWidth: '92vw' }}
+      >
+        <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+          键为音色名（以渠道上游文档为准，需完整格式，如 FunAudioLLM/CosyVoice2-0.5B:anna），值为说明（选填）。
+          整体随 /v1/models 的 voices 字段透传给下游；留空对象 {'{}'} 表示标记为 TTS 但暂不下发音色。
+        </Typography.Text>
+        <Input.TextArea
+          value={voiceDraftText}
+          onChange={setVoiceDraftText}
+          rows={12}
+          style={{ fontFamily: 'monospace', fontSize: 12 }}
+          placeholder={
+            '{\n  "FunAudioLLM/CosyVoice2-0.5B:anna": "沉稳知性女声（女性）",\n  "FunAudioLLM/CosyVoice2-0.5B:bella": "甜美活泼女声（女性）"\n}'
+          }
+        />
       </Modal>
 
       <Drawer

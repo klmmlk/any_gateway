@@ -1182,6 +1182,24 @@ async def fetch_channel_models(
 
     models = await _fetch_upstream_models(channel)
 
+    # 全量覆盖前，按模型 id 保留库里手工维护的 voices（TTS 音色列表；
+    # 空数组也保留——它表示"标记为 TTS 但尚未配音色"）
+    existing_voices: dict[str, list] = {}
+    try:
+        for m in json.loads(channel.get("models") or "[]"):
+            if isinstance(m, dict):
+                mid = str(m.get("id") or m.get("name") or "").removeprefix("models/")
+                voices = m.get("voices")
+                if mid and isinstance(voices, list):
+                    existing_voices[mid] = voices
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for m in models:
+        if isinstance(m, dict):
+            mid = str(m.get("id") or m.get("name") or "").removeprefix("models/")
+            if mid and mid in existing_voices and "voices" not in m:
+                m["voices"] = existing_voices[mid]
+
     logger.info(f"fetch-models 保存 {len(models)} 个模型到 channel={channel_id}")
 
     # 存储为 JSON string

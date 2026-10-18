@@ -1337,13 +1337,13 @@ async def forward_request(
 
 
 # 模型列表 API
-@app.get("/v1/models")
-async def list_models(
-    request: Request,
-    current_user: Optional[dict] = Depends(optional_require_auth),
-):
+async def _visible_model_entries(request: Request, current_user: Optional[dict]) -> list[dict]:
     """
-    返回可用模型列表（OpenAI 格式）。
+    按调用方可见范围收集模型条目（OpenAI 格式，含 voices 等扩展字段），
+    /v1/models 与 /v1/models/{model_id} 共用。
+
+    扩展：条目可能携带 `voices`（TTS 可用音色列表，取自 Channel.models 条目的同名键；
+    model_mapping 别名继承其映射目标模型的 voices）。
 
     认证优先级：
     1. API Key（由 middleware 注入 request.state.token_group_id / token_username）
@@ -1364,22 +1364,35 @@ async def list_models(
     def _extract_models(ch: Channel) -> list[dict]:
         provider = ch.provider or "unknown"
         entries: dict[str, dict] = {}
+        # 渠道 models 条目里的 voices（TTS 音色列表）透传给下游；别名继承映射目标的 voices
+        voices_by_mid: dict[str, list] = {}
         try:
             mods: list = json.loads(ch.models or "[]")
         except Exception:
             mods = []
         for m in mods:
-            mid = (m.get("id") or m.get("name")) if isinstance(m, dict) else str(m)
+            extra: dict = {}
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("name")
+                voices = m.get("voices")
+                if mid and isinstance(voices, list) and voices:
+                    extra["voices"] = voices
+                    voices_by_mid[str(mid).removeprefix("models/")] = voices
+            else:
+                mid = str(m)
             if mid:
-                mid = mid.removeprefix("models/")
-                entries[mid] = {"id": mid, "object": "model", "created": 0, "owned_by": provider}
+                mid = str(mid).removeprefix("models/")
+                entries[mid] = {"id": mid, "object": "model", "created": 0, "owned_by": provider, **extra}
         try:
             mapping: dict = json.loads(ch.model_mapping or "{}")
         except Exception:
             mapping = {}
-        for alias in mapping:
+        for alias, target in mapping.items():
             if alias:
-                entries[alias] = {"id": alias, "object": "model", "created": 0, "owned_by": provider}
+                entry = {"id": alias, "object": "model", "created": 0, "owned_by": provider}
+                if target in voices_by_mid:
+                    entry["voices"] = voices_by_mid[target]
+                entries[alias] = entry
         return list(entries.values())
 
     async def _channels_by_username(session, uname: str):
@@ -1439,9 +1452,32 @@ async def list_models(
                 if entry_key not in model_set:
                     model_set[entry_key] = entry
 
-    all_models = list(model_set.values())
+    return list(model_set.values())
+
+
+@app.get("/v1/models")
+async def list_models(
+    request: Request,
+    current_user: Optional[dict] = Depends(optional_require_auth),
+):
+    """返回可用模型列表（OpenAI 格式），条目可能携带扩展字段 `voices`。"""
+    all_models = await _visible_model_entries(request, current_user)
     logger.info(f"模型列表查询：{len(all_models)} 个模型")
     return JSONResponse(content={"object": "list", "data": all_models})
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model_info(
+    model_id: str,
+    request: Request,
+    current_user: Optional[dict] = Depends(optional_require_auth),
+):
+    """返回单个模型的信息（OpenAI /v1/models/{model} 风格），含 voices 等扩展字段；不存在或对调用方不可见返回 404。"""
+    wanted = model_id.removeprefix("models/").rstrip("/")
+    for entry in await _visible_model_entries(request, current_user):
+        if entry["id"] == wanted:
+            return JSONResponse(content=entry)
+    raise HTTPException(status_code=404, detail=f"Model '{wanted}' not found")
 
 
 # 刷新模型配置 API
@@ -2185,11 +2221,15 @@ if _STATIC_DIR.exists():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str) -> FileResponse:
-        """SPA fallback：dist 根目录下存在的静态文件直接返回，否则返回 index.html 由前端路由处理"""
+        """SPA fallback：dist 根目录下存在的静态文件直接返回，否则返回 index.html 由前端路由处理。
+
+        HTML 入口必须 no-cache（每次导航回源校验），否则前端重新构建后
+        浏览器会按启发式缓存继续用旧 index.html 引用的旧 JS 包。
+        """
         file_path = _STATIC_DIR / full_path
         if file_path.is_file():
-            return FileResponse(file_path)
-        return FileResponse(_STATIC_DIR / "index.html")
+            return FileResponse(file_path, headers={"Cache-Control": "no-cache"})
+        return FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":
