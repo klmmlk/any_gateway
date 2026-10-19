@@ -1099,6 +1099,10 @@ def test_models_passthrough_tts_voices(client):
     grp = next(g for g in groups_resp["data"] if g["name"] == "voices-group")
 
     voices = ["Cherry", "Serena", "Ethan"]
+    obj_voices = [
+        {"voice": "Cherry", "info": "阳光积极、亲切自然小姐姐（女性）", "trial_url": "https://example.com/cherry.mp3"},
+        {"voice": "Ethan", "info": "沉稳男性"},  # 未配置 trial_url，存储里就不应有该键
+    ]
     client.post("/admin/channels", json={
         "name": "ch-tts-voices",
         "provider": "openai",
@@ -1106,7 +1110,7 @@ def test_models_passthrough_tts_voices(client):
         "api_key": "fake-tts",
         "models": _json.dumps([
             {"id": "FunAudioLLM/CosyVoice2-0.5B", "voices": voices},
-            {"id": "cosyvoice-v2", "voices": [{"voice": "Cherry", "desc": "阳光积极、亲切自然小姐姐（女性）"}]},
+            {"id": "cosyvoice-v2", "voices": obj_voices},
             "plain-model",
         ]),
         "model_mapping": _json.dumps({"cosyvoice2": "FunAudioLLM/CosyVoice2-0.5B"}),
@@ -1128,8 +1132,8 @@ def test_models_passthrough_tts_voices(client):
 
     assert by_id["FunAudioLLM/CosyVoice2-0.5B"]["voices"] == voices
     assert by_id["cosyvoice2"]["voices"] == voices
-    # 对象格式（带说明）同样原样透传
-    assert by_id["cosyvoice-v2"]["voices"] == [{"voice": "Cherry", "desc": "阳光积极、亲切自然小姐姐（女性）"}]
+    # 对象格式（info + 可选 trial_url）原样透传：未配置的 trial_url 不出现在下游响应里
+    assert by_id["cosyvoice-v2"]["voices"] == obj_voices
     assert "voices" not in by_id["plain-model"]
 
 

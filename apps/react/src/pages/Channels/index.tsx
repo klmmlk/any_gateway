@@ -91,11 +91,12 @@ function parseMappings(model_mapping: string | null): Mapping[] {
 
 interface VoiceEntry {
   voice: string
-  desc: string
+  info: string
+  trial_url?: string
 }
 
 // 解析 models JSON：返回原始条目（保留未知扩展字段）+ 各模型音色（键存在 = 标记为 TTS）。
-// 兼容旧格式：voices 元素为纯字符串时转成 {voice, desc: ''}
+// 兼容旧格式：voices 元素为纯字符串时转成 {voice, info: ''}；旧键 desc 视同 info。
 function parseModelsDetail(models: string | null): {
   entries: Array<string | Record<string, unknown>>
   voices: Record<string, VoiceEntry[]>
@@ -113,19 +114,140 @@ function parseModelsDetail(models: string | null): {
       const id = String((e as { id?: unknown }).id ?? (e as { name?: unknown }).name ?? '')
       if (!id) continue
       voices[id] = (e as { voices: unknown[] }).voices
-        .map((v) =>
-          typeof v === 'string'
-            ? { voice: v, desc: '' }
-            : {
-                voice: String((v as { voice?: unknown }).voice ?? ''),
-                desc: String((v as { desc?: unknown }).desc ?? ''),
-              },
-        )
+        .map((v) => {
+          if (typeof v === 'string') return { voice: v, info: '' }
+          const o = v as { voice?: unknown; info?: unknown; desc?: unknown; trial_url?: unknown }
+          const entry: VoiceEntry = {
+            voice: String(o.voice ?? ''),
+            info: String(o.info ?? o.desc ?? ''),
+          }
+          if (typeof o.trial_url === 'string' && o.trial_url) entry.trial_url = o.trial_url
+          return entry
+        })
         .filter((v) => v.voice)
     }
   }
   return { entries, voices }
 }
+
+// —— 音色编辑框用 TOML 子集：[音色名] 小节 + info / trial_url 两个字符串键 ——
+// 宽松解析：小节名允许裸中文/斜杠/冒号，也可加引号；值为单双引号字符串，支持行尾 # 注释。
+const TOML_ESCAPES: Record<string, string> = { '"': '"', '\\': '\\', n: '\n', r: '\r', t: '\t' }
+
+function readTomlString(line: string, start: number, lineNo: number): [string, number] {
+  const quote = line[start]
+  if (quote !== '"' && quote !== "'") throw new Error(`第 ${lineNo} 行：值必须是带引号的字符串`)
+  let out = ''
+  let i = start + 1
+  while (i < line.length) {
+    const ch = line[i]
+    if (quote === "'") {
+      if (ch === "'") return [out, i + 1]
+      out += ch
+      i++
+      continue
+    }
+    if (ch === '\\') {
+      const nxt = line[i + 1]
+      if (!nxt || !(nxt in TOML_ESCAPES)) throw new Error(`第 ${lineNo} 行：非法转义 \\${nxt ?? ''}`)
+      out += TOML_ESCAPES[nxt]
+      i += 2
+      continue
+    }
+    if (ch === '"') return [out, i + 1]
+    out += ch
+    i++
+  }
+  throw new Error(`第 ${lineNo} 行：字符串未闭合`)
+}
+
+function checkTomlTail(line: string, i: number, lineNo: number, what: string) {
+  const rest = line.slice(i).trim()
+  if (rest && !rest.startsWith('#')) throw new Error(`第 ${lineNo} 行：${what}后有多余内容 "${rest}"`)
+}
+
+function parseTomlHeader(line: string, lineNo: number): string {
+  let i = 1
+  while (i < line.length && line[i] === ' ') i++
+  let name: string
+  if (line[i] === '"' || line[i] === "'") {
+    const [v, end] = readTomlString(line, i, lineNo)
+    name = v
+    i = end
+  } else {
+    const close = line.indexOf(']', i)
+    if (close < 0) throw new Error(`第 ${lineNo} 行：小节头缺少 ]`)
+    name = line.slice(i, close).trim()
+    i = close
+  }
+  while (i < line.length && line[i] === ' ') i++
+  if (line[i] !== ']') throw new Error(`第 ${lineNo} 行：小节头缺少 ]`)
+  i++
+  checkTomlTail(line, i, lineNo, '小节头')
+  return name
+}
+
+const parseVoicesToml = (text: string): VoiceEntry[] | string => {
+  const byName = new Map<string, VoiceEntry>()
+  let current: VoiceEntry | null = null
+  const lines = text.split(/\r?\n/)
+  for (let idx = 0; idx < lines.length; idx++) {
+    const lineNo = idx + 1
+    const line = lines[idx].trim()
+    if (!line || line.startsWith('#')) continue
+    try {
+      if (line.startsWith('[')) {
+        const name = parseTomlHeader(line, lineNo)
+        if (!name) return `第 ${lineNo} 行：音色名为空`
+        if (byName.has(name)) return `第 ${lineNo} 行：音色 "${name}" 重复`
+        current = { voice: name, info: '' }
+        byName.set(name, current)
+        continue
+      }
+      const eq = line.indexOf('=')
+      if (eq < 0) throw new Error('无法识别的行（应为 [音色名] 或 key = "值"）')
+      const [key, keyEnd] = (() => {
+        const raw = line.slice(0, eq)
+        const s = raw.trim()
+        if (s.startsWith('"') || s.startsWith("'")) return readTomlString(raw, raw.indexOf(s[0]), lineNo)
+        return [s, raw.length] as [string, number]
+      })()
+      checkTomlTail(line.slice(0, eq), keyEnd, lineNo, '键')
+      if (!current) throw new Error(`${key} 出现在任何 [音色名] 小节之前`)
+      if (key !== 'info' && key !== 'trial_url') throw new Error(`不支持的键 "${key}"（只支持 info / trial_url）`)
+      const rest = line.slice(eq + 1)
+      const [val, end] = readTomlString(rest, rest.search(/["']/), lineNo)
+      checkTomlTail(rest, end, lineNo, '值')
+      if (key === 'info') current.info = val.trim()
+      else if (val.trim()) current.trial_url = val.trim()
+    } catch (e) {
+      return `第 ${lineNo} 行：` + (e instanceof Error ? e.message : String(e))
+    }
+  }
+  return Array.from(byName.values())
+}
+
+const quoteTomlName = (name: string) =>
+  /^[A-Za-z0-9_-]+$/.test(name) ? `[${name}]` : `[${JSON.stringify(name)}]`
+
+const voicesToToml = (voices: VoiceEntry[]): string => {
+  const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')
+  return voices
+    .map((v) => {
+      const lines = [quoteTomlName(v.voice)]
+      if (v.info) lines.push(`info = "${esc(v.info)}"`)
+      if (v.trial_url) lines.push(`trial_url = "${esc(v.trial_url)}"`)
+      return lines.join('\n')
+    })
+    .join('\n\n')
+}
+
+// 存储条目：空 info 不落库，未配置的 trial_url 不落库（下游就收不到该字段）
+const toStorageVoice = (v: VoiceEntry) => ({
+  voice: v.voice,
+  ...(v.info ? { info: v.info } : {}),
+  ...(v.trial_url ? { trial_url: v.trial_url } : {}),
+})
 
 const Channels: React.FC = () => {
   const [data, setData] = useState<Channel[]>([])
@@ -149,7 +271,7 @@ const Channels: React.FC = () => {
   const [modelVoices, setModelVoices] = useState<Record<string, VoiceEntry[]>>({})
   // 打开弹窗时的原始 models 条目，保存时未标记 TTS 的条目原样保留（不丢未知扩展字段）
   const [originalEntries, setOriginalEntries] = useState<Array<string | Record<string, unknown>>>([])
-  // 音色编辑二级弹窗（单个 JSON 输入框）
+  // 音色编辑二级弹窗（单个 TOML 输入框）
   const [voiceEditorModel, setVoiceEditorModel] = useState<string | null>(null)
   const [voiceDraftText, setVoiceDraftText] = useState('')
 
@@ -409,37 +531,13 @@ const Channels: React.FC = () => {
     setVoiceDraftText(voicesToEditorText(modelVoices[id] ?? []))
   }
 
-  // 编辑框用「音色名 → 说明」的键值对格式，写起来最省事；存储与 /v1/models 仍是 [{voice, desc}] 数组
-  const voicesToEditorText = (voices: VoiceEntry[]): string =>
-    JSON.stringify(Object.fromEntries(voices.map((v) => [v.voice, v.desc])), null, 2)
-
-  const parseVoicesJson = (text: string): VoiceEntry[] | string => {
-    let obj: unknown
-    try {
-      obj = JSON.parse(text)
-    } catch (e) {
-      return 'JSON 语法错误：' + (e instanceof Error ? e.message : String(e))
-    }
-    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
-      return '必须是一个 JSON 对象：键为音色名，值为说明'
-    }
-    const out: VoiceEntry[] = []
-    for (const [rawKey, value] of Object.entries(obj as Record<string, unknown>)) {
-      const voice = rawKey.trim()
-      if (!voice) return '存在空的音色名（键）'
-      if (value !== null && value !== undefined && typeof value !== 'string') {
-        return `音色 ${voice} 的说明必须是字符串`
-      }
-      out.push({ voice, desc: typeof value === 'string' ? value.trim() : '' })
-    }
-    const names = out.map((v) => v.voice)
-    if (new Set(names).size !== names.length) return '存在重复的音色名（首尾空格会被忽略）'
-    return out
-  }
+  // 编辑框用 TOML：一个音色一个小节，info 说明 + trial_url 试听地址（选填）；
+  // 存储与 /v1/models 仍是 voices 数组（{voice, info, trial_url?}），trial_url 未配置就不下发。
+  const voicesToEditorText = voicesToToml
 
   const saveVoiceEditor = () => {
     if (!voiceEditorModel) return
-    const parsed = parseVoicesJson(voiceDraftText)
+    const parsed = parseVoicesToml(voiceDraftText)
     if (typeof parsed === 'string') {
       Message.error(parsed)
       return
@@ -471,7 +569,7 @@ const Channels: React.FC = () => {
         return {
           ...(original && typeof original === 'object' ? original : {}),
           id,
-          voices: modelVoices[id],
+          voices: modelVoices[id].map(toStorageVoice),
         }
       })
 
@@ -818,8 +916,9 @@ const Channels: React.FC = () => {
         style={{ width: 600, maxWidth: '92vw' }}
       >
         <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
-          键为音色名（以渠道上游文档为准，需完整格式，如 FunAudioLLM/CosyVoice2-0.5B:anna），值为说明（选填）。
-          整体随 /v1/models 的 voices 字段透传给下游；留空对象 {'{}'} 表示标记为 TTS 但暂不下发音色。
+          每个音色一个小节，小节名为音色名（以渠道上游文档为准，需完整格式，如 FunAudioLLM/CosyVoice2-0.5B:anna）。
+          info 为说明（选填）；trial_url 为试听音频地址（选填，不填则不返回给客户端）。
+          整体随 /v1/models 的 voices 字段透传给下游；只写小节头表示标记为 TTS 但暂不下发音色。
         </Typography.Text>
         <Input.TextArea
           value={voiceDraftText}
@@ -827,7 +926,7 @@ const Channels: React.FC = () => {
           rows={12}
           style={{ fontFamily: 'monospace', fontSize: 12 }}
           placeholder={
-            '{\n  "FunAudioLLM/CosyVoice2-0.5B:anna": "沉稳知性女声（女性）",\n  "FunAudioLLM/CosyVoice2-0.5B:bella": "甜美活泼女声（女性）"\n}'
+            '["FunAudioLLM/CosyVoice2-0.5B:anna"]\ninfo = "沉稳知性女声（女性）"\ntrial_url = "https://example.com/anna.mp3"\n\n["FunAudioLLM/CosyVoice2-0.5B:bella"]\ninfo = "甜美活泼女声（女性）"'
           }
         />
       </Modal>
