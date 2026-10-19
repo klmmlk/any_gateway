@@ -202,6 +202,7 @@ async def _seed_channel_and_token(
     upstream_key: str = "test-upstream-key",
     quota_usd: float = 100.0,
     used_usd: float = 0.0,
+    models: list[str] | None = None,
 ) -> tuple[str, str]:
     from db.models import Channel, GroupChannel, Token, User, UserGroup
 
@@ -220,12 +221,12 @@ async def _seed_channel_and_token(
         ch = Channel(
             id=uuid4().hex,
             name=f"dashscope-asr-{unique}",
-            provider="dashscope-asr",
+            provider="dashscope",
             base_url=base_url,
             api_key=upstream_key,
             weight=1,
             enabled=True,
-            models=json.dumps(["qwen-audio-3.0-asr-flash-streaming"]),
+            models=json.dumps(models or ["qwen-audio-3.0-asr-flash-streaming"]),
             model_mapping=None,
             protocol=protocol,
             ws_path="/api-ws/v1/inference",
@@ -348,7 +349,7 @@ async def test_end_to_end_passthrough_with_billing(server_url, tmp_path, monkeyp
         assert got[1] == b"\x01\x02binary"
         assert got[2] == "frame-3"
 
-        # 等待 fire-and-forget _finalize_asr_usage 完成
+        # 等待 fire-and-forget _finalize_ws_usage 完成
         await asyncio.sleep(0.5)
         log = await _latest_usage_log()
         assert log is not None
@@ -497,3 +498,152 @@ def test_extract_asr_summary_empty_input():
 
     summary = _gw._extract_asr_summary([])
     assert summary == {"transcript": "", "errors": []}
+
+
+# ============================================================
+# _extract_ws_usage：task-finished 帧 usage 离线解析（多计费模式）
+# ============================================================
+def _finished_usage_frame(usage: dict) -> str:
+    return json.dumps({
+        "header": {"task_id": "t1", "event": "task-finished"},
+        "payload": {"usage": usage},
+    }, ensure_ascii=False)
+
+
+def test_extract_ws_usage_tokens_variant():
+    """Qwen TTS 3.1 形态：usage 报 tokens。"""
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(event="task-started"),
+        _finished_usage_frame({"input_tokens": 10, "output_tokens": 25}),
+    ]
+    usage = _gw._extract_ws_usage(frames)
+    assert usage["input_tokens"] == 10
+    assert usage["output_tokens"] == 25
+    assert usage["characters"] == 0
+    assert usage["usage_raw"] == {"input_tokens": 10, "output_tokens": 25}
+    assert len(usage["finished_frames"]) == 1
+
+
+def test_extract_ws_usage_characters_variant():
+    """CosyVoice / Qwen TTS 3.0 形态：usage 报字符数。"""
+    import gateway as _gw
+
+    frames = [_finished_usage_frame({"input_characters": 42})]
+    usage = _gw._extract_ws_usage(frames)
+    assert usage["characters"] == 42
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+
+
+def test_extract_ws_usage_no_usage_frame():
+    """没有 finished/usage 帧时全为 0，不抛异常。"""
+    import gateway as _gw
+
+    frames = [
+        _dashscope_frame(sentence={"text": "你好"}),
+        "not-json",
+    ]
+    usage = _gw._extract_ws_usage(frames)
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+    assert usage["characters"] == 0
+    assert usage["usage_raw"] == {}
+    assert usage["finished_frames"] == []
+
+
+# ============================================================
+# /v1/audio/tts/stream 别名路由 + 上游帧用量计费 E2E
+# ============================================================
+class UpstreamWithFinishedFrame(UpstreamEcho):
+    """echo 上游：首条消息 echo 后额外下发一条 task-finished usage 帧。"""
+
+    def __init__(self, finished_frame: str) -> None:
+        super().__init__()
+        self.finished_frame = finished_frame
+
+    async def handler(self, ws):
+        sent_usage = False
+        async for msg in ws:
+            self.received.append(msg)
+            await ws.send(msg)
+            if not sent_usage:
+                await ws.send(self.finished_frame)
+                sent_usage = True
+
+
+async def _seed_model_price(model: str, unit: str, price: float) -> None:
+    from db.models import ModelPrice
+    async with AsyncSession(TEST_ENGINE, expire_on_commit=False) as session:
+        session.add(ModelPrice(model_name=model, unit=unit, price_per_unit=price))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_tts_alias_route_bills_per_request(server_url):
+    """/v1/audio/tts/stream 别名连通；配了 request 单价即按次计费，用量字段照记。"""
+    model = "qwen-audio-3.0-tts"
+    ch_id, api_key = await _seed_channel_and_token(
+        api_key="sk-ttsalias0001",
+        models=[model],
+    )
+    await _seed_model_price(model, "request", 0.01)
+    upstream = UpstreamWithFinishedFrame(_finished_usage_frame({"input_characters": 123}))
+    upstream.start_in_thread()
+    await _patch_channel_base_url(ch_id, upstream.url)
+
+    try:
+        async with websockets.connect(
+            f"{server_url['ws']}/v1/audio/tts/stream?model={model}&api_key={api_key}"
+        ) as ws:
+            await ws.send(json.dumps({"header": {"event": "run-task"}, "payload": {}}))
+            # echo + finished 帧
+            got = [await asyncio.wait_for(ws.recv(), timeout=5.0) for _ in range(2)]
+
+        assert json.loads(got[0])["header"]["event"] == "run-task"
+        assert json.loads(got[1])["header"]["event"] == "task-finished"
+
+        await asyncio.sleep(0.5)
+        log = await _latest_usage_log()
+        assert log is not None
+        assert log.model == model
+        assert log.channel_id == ch_id
+        assert log.characters == 123
+        # 按次计费：固定 request 单价，与墙钟/用量无关
+        assert abs(log.cost_usd - 0.01) < 1e-9
+    finally:
+        upstream.stop()
+
+
+@pytest.mark.asyncio
+async def test_tts_bills_per_character_from_upstream_usage(server_url):
+    """配了 character 单价时，从上游 task-finished usage 的字符数计费。"""
+    model = "cosyvoice-v2-test"
+    ch_id, api_key = await _seed_channel_and_token(
+        api_key="sk-ttschar00001",
+        models=[model],
+    )
+    await _seed_model_price(model, "character", 30.0)  # 30 USD / 1M 字符
+    upstream = UpstreamWithFinishedFrame(_finished_usage_frame({"input_characters": 42}))
+    upstream.start_in_thread()
+    await _patch_channel_base_url(ch_id, upstream.url)
+
+    try:
+        async with websockets.connect(
+            f"{server_url['ws']}/v1/audio/tts/stream?model={model}&api_key={api_key}"
+        ) as ws:
+            await ws.send("run-task-frame")
+            got = [await asyncio.wait_for(ws.recv(), timeout=5.0) for _ in range(2)]
+
+        assert got[0] == "run-task-frame"
+
+        await asyncio.sleep(0.5)
+        log = await _latest_usage_log()
+        assert log is not None
+        assert log.model == model
+        assert log.characters == 42
+        # 42 / 1M * 30 = 0.00126
+        assert abs(log.cost_usd - 0.00126) < 1e-9
+    finally:
+        upstream.stop()

@@ -52,6 +52,7 @@ async def update_usage(
     cache_creation_tokens: int = 0,
     covered_by_package: bool = False,
     audio_seconds: float = 0.0,
+    characters: int = 0,
 ) -> None:
     """
     1. 递增 Token.used_usd（通过 SQL 级原子 UPDATE）
@@ -68,6 +69,7 @@ async def update_usage(
 
     audio_seconds：仅 ASR 类请求使用（与 token 计费互斥），
     写入 UsageLog.audio_seconds 便于审计追溯；金额由 calculate_cost 计算后传入。
+    characters：TTS 类请求按字符计费的用量（来源：上游 finished 帧 usage），同理仅审计用。
     """
     for attempt in range(1, _USAGE_MAX_RETRIES + 1):
         try:
@@ -96,6 +98,7 @@ async def update_usage(
                     username=username,
                     covered_by_package=covered_by_package,
                     audio_seconds=audio_seconds,
+                    characters=characters,
                 )
                 session.add(log)
                 await session.commit()

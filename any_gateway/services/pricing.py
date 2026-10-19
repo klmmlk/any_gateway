@@ -59,11 +59,13 @@ async def calculate_cost(
     cache_creation_tokens: int = 0,
     multiplier: float = 1.0,
     audio_seconds: float = 0.0,
+    characters: int = 0,
 ) -> float:
     """计算本次请求费用（USD）。
 
-    优先检查 request 定价（固定费），其次 audio_second 定价（ASR 类），
-    最后按 token 公式计算。multiplier 传入 group.multiplier（默认 1.0）。
+    按价格管理里配了哪种单位就用哪种，优先级：
+    request（按次固定费）> audio_second（按音频秒）> character（按字符，TTS 类）
+    > token 公式。multiplier 传入 group.multiplier（默认 1.0）。
     """
     M = 1_000_000
 
@@ -71,12 +73,18 @@ async def calculate_cost(
     if req_price > 0:
         return round(req_price * multiplier, 8)
 
-    # ASR 类按音频时长计费：单价为「每 1 秒 USD」，
+    # 按音频时长计费：单价为「每 1 秒 USD」，
     # 与 token 计费互斥（一次 ASR 请求只产生 audio_seconds，不产生 token）。
     if audio_seconds > 0:
         audio_price = await _lookup_price(session, group_id, model, "audio_second")
         if audio_price > 0:
             return round(audio_seconds * audio_price * multiplier, 8)
+
+    # TTS 类按字符计费：单价为「每 1M 字符 USD」，characters 来自上游 finished 帧 usage。
+    if characters > 0:
+        char_price = await _lookup_price(session, group_id, model, "character")
+        if char_price > 0:
+            return round(characters / M * char_price * multiplier, 8)
 
     input_price = await _lookup_price(session, group_id, model, "input_token")
     output_price = await _lookup_price(session, group_id, model, "output_token")

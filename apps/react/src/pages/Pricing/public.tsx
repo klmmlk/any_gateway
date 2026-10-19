@@ -22,6 +22,10 @@ interface ModelEntry {
   output_token?: number
   cache_read_token?: number
   cache_write_token?: number
+  /** 语音/非 token 计费：按次、按音频秒（ASR）、按字符（TTS） */
+  request?: number
+  audio_second?: number
+  character?: number
 }
 
 interface GroupedModels {
@@ -58,6 +62,9 @@ function buildModels(rows: PriceRow[]): GroupedModels {
     else if (row.unit === 'output_token') entry.output_token = row.price_per_unit
     else if (row.unit === 'cache_read_token') entry.cache_read_token = row.price_per_unit
     else if (row.unit === 'cache_write_token') entry.cache_write_token = row.price_per_unit
+    else if (row.unit === 'request') entry.request = row.price_per_unit
+    else if (row.unit === 'audio_second') entry.audio_second = row.price_per_unit
+    else if (row.unit === 'character') entry.character = row.price_per_unit
   }
 
   const grouped: GroupedModels = {}
@@ -195,6 +202,7 @@ const PublicPricing: React.FC = () => {
                         <th>输入价格</th>
                         <th>输出价格</th>
                         <th>缓存输入</th>
+                        <th>语音 / 其他计费</th>
                         <th>稳定性</th>
                       </tr>
                     </thead>
@@ -233,6 +241,32 @@ const PublicPricing: React.FC = () => {
                                 <span className="ag-pricing-price ag-pricing-price-muted">{formatPrice(m.cache_read_token)}</span>
                                 <span className="ag-pricing-price-unit">/ 1M</span>
                               </>
+                            ) : (
+                              <span className="ag-pricing-na">-</span>
+                            )}
+                          </td>
+                          <td>
+                            {(m.request != null || m.audio_second != null || m.character != null) ? (
+                              <div>
+                                {m.request != null && (
+                                  <div>
+                                    <span className="ag-pricing-price ag-pricing-price-muted">{formatPrice(m.request)}</span>
+                                    <span className="ag-pricing-price-unit"> / 次</span>
+                                  </div>
+                                )}
+                                {m.audio_second != null && (
+                                  <div>
+                                    <span className="ag-pricing-price ag-pricing-price-muted">{formatPrice(m.audio_second)}</span>
+                                    <span className="ag-pricing-price-unit"> / 秒</span>
+                                  </div>
+                                )}
+                                {m.character != null && (
+                                  <div>
+                                    <span className="ag-pricing-price ag-pricing-price-muted">{formatPrice(m.character)}</span>
+                                    <span className="ag-pricing-price-unit"> / 1M 字符</span>
+                                  </div>
+                                )}
+                              </div>
                             ) : (
                               <span className="ag-pricing-na">-</span>
                             )}

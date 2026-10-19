@@ -270,6 +270,103 @@ def test_calculate_cost_audio_zero_falls_back_to_token():
     assert abs(result - 25.0) < 1e-9
 
 
+def test_calculate_cost_character_unit():
+    """character 单位：按字符计费（TTS），单价为每 1M 字符 USD。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="qwen-tts", unit="character", price_per_unit=30.0))
+            await session.commit()
+            # 2M 字符 * 30 USD/1M = 60 USD
+            return await calculate_cost(
+                session, None, "qwen-tts",
+                input_tokens=0, output_tokens=0,
+                characters=2_000_000,
+            )
+
+    result = asyncio.run(run())
+    assert abs(result - 60.0) < 1e-9
+
+
+def test_calculate_cost_priority_request_over_character():
+    """request 与 character 同时配置时，按次优先。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="qwen-tts", unit="request", price_per_unit=0.01))
+            session.add(ModelPrice(model_name="qwen-tts", unit="character", price_per_unit=30.0))
+            await session.commit()
+            return await calculate_cost(
+                session, None, "qwen-tts",
+                input_tokens=0, output_tokens=0,
+                characters=2_000_000,
+            )
+
+    result = asyncio.run(run())
+    assert abs(result - 0.01) < 1e-9
+
+
+def test_calculate_cost_priority_audio_second_over_character():
+    """audio_second 与 character 同时配置且有音频时长时，按秒优先。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="voice", unit="audio_second", price_per_unit=0.001))
+            session.add(ModelPrice(model_name="voice", unit="character", price_per_unit=30.0))
+            await session.commit()
+            return await calculate_cost(
+                session, None, "voice",
+                input_tokens=0, output_tokens=0,
+                audio_seconds=10.0,
+                characters=100_000,
+            )
+
+    # 10 秒 * 0.001 = 0.01（不按字符算 3.0）
+    result = asyncio.run(run())
+    assert abs(result - 0.01) < 1e-9
+
+
+def test_calculate_cost_character_no_price_falls_to_token():
+    """有字符用量但未配 character 单价时，落到 token 公式。"""
+    from services.pricing import calculate_cost
+    from db.models import ModelPrice
+
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+        async with engine.begin() as conn:
+            import db.models  # noqa
+            await conn.run_sync(SQLModel.metadata.create_all)
+        async with AsyncSession(engine) as session:
+            session.add(ModelPrice(model_name="qwen-tts", unit="input_token", price_per_unit=10.0))
+            await session.commit()
+            return await calculate_cost(
+                session, None, "qwen-tts",
+                input_tokens=1_000_000, output_tokens=0,
+                characters=500_000,
+            )
+
+    result = asyncio.run(run())
+    assert abs(result - 10.0) < 1e-9
+
+
 # ── Task 3 tests ──────────────────────────────────────────────────────────────
 
 ADMIN_HEADERS = {"x-admin-key": "test-admin-secret"}

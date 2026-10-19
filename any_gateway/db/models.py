@@ -156,6 +156,9 @@ class UsageLog(SQLModel, table=True):
     # 音频时长（秒），用于 ASR 类请求的按秒计费。
     # 非 ASR 请求为 0。
     audio_seconds: float = Field(default=0)
+    # 字符数，用于 TTS 类请求的按字符计费（来源：上游 task-finished 帧 usage）。
+    # 非按字符计费的请求为 0。
+    characters: int = Field(default=0)
     created_at: str = Field(default_factory=utcnow)
 
 
@@ -270,8 +273,10 @@ class RateLimitUpdate(SQLModel):
 # =======================
 # ModelPrice（全局价格表）
 # unit: "input_token" | "output_token" | "cache_read_token" |
-#       "cache_write_token" | "extra_context_token" | "request"
-# price_per_unit: token 类为每 1M token USD；request 类为每次请求 USD
+#       "cache_write_token" | "extra_context_token" | "request" |
+#       "audio_second" | "character"
+# price_per_unit: token/character 类为每 1M 单位 USD；request 类为每次请求 USD；
+#                 audio_second 为每秒 USD
 # =======================
 
 

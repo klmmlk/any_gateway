@@ -5,6 +5,7 @@ import {
 } from '@arco-design/web-react'
 import { IconPlus } from '@arco-design/web-react/icon'
 import { getPrices, createPrice, updatePrice, deletePrice } from '../../api/prices'
+import { getChannels } from '../../api/channels'
 
 interface PriceRow {
   id: string
@@ -29,6 +30,8 @@ interface ModelGroup {
   request?: number
   /** ASR 类按音频时长（秒）计费的单价（USD/秒）。 */
   audio_second?: number
+  /** TTS 类按字符计费的单价（USD/百万字符）。 */
+  character?: number
   rows: PriceRow[]
 }
 
@@ -45,7 +48,7 @@ function groupByModel(data: PriceRow[]): ModelGroup[] {
     if (row.context_length) g.context_length = row.context_length
     if (row.stability) g.stability = row.stability
     const unit = row.unit as keyof ModelGroup
-    if (['input_token', 'output_token', 'cache_read_token', 'cache_write_token', 'extra_context_token', 'request', 'audio_second'].includes(row.unit)) {
+    if (['input_token', 'output_token', 'cache_read_token', 'cache_write_token', 'extra_context_token', 'request', 'audio_second', 'character'].includes(row.unit)) {
       ;(g as any)[unit] = row.price_per_unit
     }
   }
@@ -66,12 +69,24 @@ function formatPrice(v?: number) {
 
 const VENDOR_OPTIONS = ['DeepSeek', 'Anthropic', 'OpenAI', 'Google', 'Alibaba', 'Volcengine', 'Zhipu AI', 'Other']
 
+// 计价模式 → 该模式下的 unit 集合；一个模型只保留一种模式，
+// 切换模式时删除其他模式的价目行（calculate_cost 按 request > audio_second > character > token 取优先级，残留旧行会错账）
+type PriceMode = 'token' | 'request' | 'audio_second' | 'character'
+const MODE_UNITS: Record<PriceMode, string[]> = {
+  token: ['input_token', 'output_token', 'cache_read_token', 'cache_write_token', 'extra_context_token'],
+  request: ['request'],
+  audio_second: ['audio_second'],
+  character: ['character'],
+}
+
 const Prices: React.FC = () => {
   const [data, setData] = useState<PriceRow[]>([])
   const [loading, setLoading] = useState(false)
   const [visible, setVisible] = useState(false)
   const [editing, setEditing] = useState<ModelGroup | null>(null)
-  const [priceMode, setPriceMode] = useState<'token' | 'request'>('token')
+  const [priceMode, setPriceMode] = useState<PriceMode>('token')
+  // 模型名候选：从渠道已配置的模型（含映射别名）拉取，也允许手输尚未建渠道的模型
+  const [modelOptions, setModelOptions] = useState<string[]>([])
   const [form] = Form.useForm()
   const [searchText, setSearchText] = useState('')
 
@@ -90,6 +105,27 @@ const Prices: React.FC = () => {
 
   useEffect(() => { fetchData() }, [fetchData])
 
+  useEffect(() => {
+    getChannels()
+      .then((res) => {
+        const raw = res.data?.data ?? res.data ?? []
+        const names = new Set<string>()
+        for (const ch of raw) {
+          try {
+            for (const m of JSON.parse(ch.models || '[]')) {
+              if (typeof m === 'string') names.add(m)
+              else if (m && typeof m === 'object' && m.id) names.add(String(m.id))
+            }
+          } catch { /* noop */ }
+          try {
+            for (const alias of Object.keys(JSON.parse(ch.model_mapping || '{}'))) names.add(alias)
+          } catch { /* noop */ }
+        }
+        setModelOptions(Array.from(names).sort())
+      })
+      .catch(() => { /* 候选拉取失败不阻塞表单，仍可手输 */ })
+  }, [])
+
   const groups = groupByModel(data)
   const filtered = searchText
     ? groups.filter(g => g.model_name.toLowerCase().includes(searchText.toLowerCase()))
@@ -98,8 +134,16 @@ const Prices: React.FC = () => {
   const handleOpen = (group?: ModelGroup) => {
     setEditing(group || null)
     if (group) {
-      const hasRequest = group.rows.some(r => r.unit === 'request')
-      setPriceMode(hasRequest ? 'request' : 'token')
+      // 模式从已有行推断，与 calculate_cost 的优先级一致：request > audio_second > character > token
+      const hasUnit = (u: string) => group.rows.some((r) => r.unit === u)
+      const mode: PriceMode = hasUnit('request')
+        ? 'request'
+        : hasUnit('audio_second')
+          ? 'audio_second'
+          : hasUnit('character')
+            ? 'character'
+            : 'token'
+      setPriceMode(mode)
       form.setFieldsValue({
         model_name: group.model_name,
         vendor: group.vendor || undefined,
@@ -112,6 +156,7 @@ const Prices: React.FC = () => {
         extra_context_price: group.extra_context_token,
         request_price: group.request,
         audio_price: group.audio_second,
+        char_price: group.character,
       })
     } else {
       setPriceMode('token')
@@ -127,85 +172,57 @@ const Prices: React.FC = () => {
         vendor: values.vendor || undefined,
         stability: values.stability || undefined,
       }
-
-      if (editing) {
-        const unitPriceMap: Record<string, number | undefined> = {
+      // 当前模式的字段 → unit 价格
+      const modePrices: Record<PriceMode, Record<string, number | undefined>> = {
+        token: {
           input_token: values.input_price,
           output_token: values.output_price,
           cache_read_token: values.cache_read_price,
           cache_write_token: values.cache_write_price,
           extra_context_token: values.extra_context_price,
-          request: values.request_price,
-          audio_second: values.audio_price,
-        }
+        },
+        request: { request: values.request_price },
+        audio_second: { audio_second: values.audio_price },
+        character: { character: values.char_price },
+      }
 
+      if (editing) {
+        // 切换模式时删除其他模式的价目行，保证一个模型只有一种计费模式
+        const staleUnits = new Set(
+          Object.values(MODE_UNITS).flat().filter((u) => !MODE_UNITS[priceMode].includes(u)),
+        )
         for (const row of editing.rows) {
-          const newPrice = unitPriceMap[row.unit]
-          await updatePrice(row.id, {
-            price_per_unit: newPrice ?? row.price_per_unit,
-            ...meta,
-          })
+          if (staleUnits.has(row.unit)) {
+            await deletePrice(row.id)
+          }
         }
-
-        // audio_second: 单独处理（独立 unit，可能还没创建过）
-        const existingAudioRow = editing.rows.find(r => r.unit === 'audio_second')
-        if (values.audio_price != null && values.audio_price > 0 && !existingAudioRow) {
-          await createPrice({
-            model_name: editing.model_name,
-            unit: 'audio_second',
-            price_per_unit: values.audio_price,
-            ...meta,
-          })
+        // 当前模式：已有行更新价格，缺的行按填写值补建
+        const rowsByUnit = new Map(editing.rows.map((r) => [r.unit, r]))
+        for (const [unit, price] of Object.entries(modePrices[priceMode])) {
+          const existing = rowsByUnit.get(unit)
+          if (existing) {
+            await updatePrice(existing.id, { price_per_unit: price ?? existing.price_per_unit, ...meta })
+          } else if (price != null && price > 0) {
+            await createPrice({ model_name: editing.model_name, unit, price_per_unit: price, ...meta })
+          }
         }
-
-        if (priceMode === 'token') {
-          const existingUnits = new Set(editing.rows.map(r => r.unit))
-          const newUnits = [
-            { unit: 'input_token', price: values.input_price },
-            { unit: 'output_token', price: values.output_price },
-            { unit: 'cache_read_token', price: values.cache_read_price },
-            { unit: 'cache_write_token', price: values.cache_write_price },
-            { unit: 'extra_context_token', price: values.extra_context_price },
-          ].filter(c => c.price != null && c.price > 0 && !existingUnits.has(c.unit))
-
-          await Promise.all(
-            newUnits.map(c => createPrice({
-              model_name: editing.model_name,
-              unit: c.unit,
-              price_per_unit: c.price,
-              ...meta,
-            }))
-          )
-        }
-
         Message.success('已更新')
       } else {
         const creates: Array<{ unit: string; price: number }> = []
-        if (priceMode === 'request') {
-          creates.push({ unit: 'request', price: values.request_price })
-        } else {
-          ;[
-            { unit: 'input_token', price: values.input_price },
-            { unit: 'output_token', price: values.output_price },
-            { unit: 'cache_read_token', price: values.cache_read_price },
-            { unit: 'cache_write_token', price: values.cache_write_price },
-            { unit: 'extra_context_token', price: values.extra_context_price },
-          ].forEach(c => {
-            if (c.price != null && c.price > 0) creates.push(c)
-          })
+        for (const [unit, price] of Object.entries(modePrices[priceMode])) {
+          if (price != null && price > 0) creates.push({ unit, price })
         }
-        // ASR 音频时长（秒）单价：与 priceMode 独立，无论 token / request 模式都可设置
-        if (values.audio_price != null && values.audio_price > 0) {
-          creates.push({ unit: 'audio_second', price: values.audio_price })
+        if (creates.length === 0) {
+          Message.warning('请至少填写一项单价')
+          return
         }
-
         await Promise.all(
-          creates.map(c => createPrice({
+          creates.map((c) => createPrice({
             model_name: values.model_name,
             unit: c.unit,
             price_per_unit: c.price,
             ...meta,
-          }))
+          })),
         )
         Message.success('已创建')
       }
@@ -275,6 +292,14 @@ const Prices: React.FC = () => {
       width: 130,
       render: (v?: number) => v != null
         ? <Tag color="orange"><span style={{ fontFamily: 'monospace' }}>${v.toFixed(4)}</span></Tag>
+        : <span style={{ color: '#c0c0c0' }}>-</span>,
+    },
+    {
+      title: '字符 (/1M)',
+      dataIndex: 'character',
+      width: 110,
+      render: (v?: number) => v != null
+        ? <Tag color="purple"><span style={{ fontFamily: 'monospace' }}>${v.toFixed(4)}</span></Tag>
         : <span style={{ color: '#c0c0c0' }}>-</span>,
     },
     {
@@ -352,17 +377,17 @@ const Prices: React.FC = () => {
         style={{ width: 520 }}
       >
         <Form form={form} onSubmit={handleSubmit} layout="vertical">
-          {!editing && (
-            <Form.Item label="计价模式">
-              <Radio.Group
-                value={priceMode}
-                onChange={(v) => { setPriceMode(v); form.resetFields(['unit']) }}
-              >
-                <Radio value="token">按 Token</Radio>
-                <Radio value="request">按请求次数</Radio>
-              </Radio.Group>
-            </Form.Item>
-          )}
+          <Form.Item label="计价模式" extra="一个模型只按一种模式计费；编辑时切换模式会清除其他模式的单价">
+            <Radio.Group
+              value={priceMode}
+              onChange={(v: PriceMode) => setPriceMode(v)}
+            >
+              <Radio value="token">按 Token</Radio>
+              <Radio value="request">按请求次数</Radio>
+              <Radio value="audio_second">按音频秒</Radio>
+              <Radio value="character">按字符</Radio>
+            </Radio.Group>
+          </Form.Item>
 
           {!editing && (
             <Form.Item
@@ -370,7 +395,16 @@ const Prices: React.FC = () => {
               label="模型名称"
               rules={[{ required: true }]}
             >
-              <Input placeholder="如 gpt-4o 或 deepseek-v3" />
+              <Select
+                placeholder="从已配置模型中选择，或输入新名称"
+                allowCreate
+                allowClear
+                showSearch
+              >
+                {modelOptions.map((m) => (
+                  <Select.Option key={m} value={m}>{m}</Select.Option>
+                ))}
+              </Select>
             </Form.Item>
           )}
 
@@ -421,14 +455,27 @@ const Prices: React.FC = () => {
             </Form.Item>
           )}
 
-          {/* ASR 音频时长（秒）单价：与 priceMode 独立，token / request 模式都可设置 */}
-          <Form.Item
-            field="audio_price"
-            label="音频秒单价 (USD/秒)"
-            extra="ASR 实时语音识别按音频时长计费；留空表示不启用按秒计费"
-          >
-            <InputNumber min={0} step={0.0001} precision={6} style={{ width: '100%' }} />
-          </Form.Item>
+          {priceMode === 'audio_second' && (
+            <Form.Item
+              field="audio_price"
+              label="音频秒单价 (USD/秒)"
+              rules={[{ required: true }]}
+              extra="ASR 实时语音识别按音频时长计费（客户端声明或墙钟时长）"
+            >
+              <InputNumber min={0} step={0.0001} precision={6} style={{ width: '100%' }} />
+            </Form.Item>
+          )}
+
+          {priceMode === 'character' && (
+            <Form.Item
+              field="char_price"
+              label="字符单价 (USD/百万字符)"
+              rules={[{ required: true }]}
+              extra="TTS 语音合成按字符计费（用量取自上游任务结束帧 usage）"
+            >
+              <InputNumber min={0} step={0.01} precision={6} style={{ width: '100%' }} />
+            </Form.Item>
+          )}
         </Form>
       </Modal>
     </div>

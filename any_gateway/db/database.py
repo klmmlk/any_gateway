@@ -92,6 +92,15 @@ async def init_db():
     except Exception:
         pass
 
+    # usage_logs 表加 characters（TTS 按字符计费，幂等自动加列）
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE usage_logs ADD COLUMN characters INTEGER DEFAULT 0"
+            ))
+    except Exception:
+        pass
+
     # vouchers 表的兑卡时长（匿名兑卡直接吐 key 的有效天数，幂等自动加列）
     async with engine.begin() as conn:
         try:

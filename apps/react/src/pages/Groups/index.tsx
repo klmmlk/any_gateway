@@ -41,7 +41,7 @@ const Groups: React.FC = () => {
   const [managingPriceGroup, setManagingPriceGroup] = useState<any>(null)
   const [groupPrices, setGroupPrices] = useState<any[]>([])
   const [priceLoading, setPriceLoading] = useState(false)
-  const [newPriceMode, setNewPriceMode] = useState<'token' | 'request'>('token')
+  const [newPriceMode, setNewPriceMode] = useState<'token' | 'request' | 'audio_second' | 'character'>('token')
   const [newPriceModelName, setNewPriceModelName] = useState('')
   const [newPriceUnit, setNewPriceUnit] = useState('input_token')
   const [newPriceValue, setNewPriceValue] = useState<number>(0)
@@ -248,7 +248,7 @@ const Groups: React.FC = () => {
     }
     setAddPriceLoading(true)
     try {
-      const unit = newPriceMode === 'request' ? 'request' : newPriceUnit
+      const unit = newPriceMode === 'token' ? newPriceUnit : newPriceMode
       await createGroupPrice({
         group_id: managingPriceGroup.id,
         model_name: newPriceModelName.trim(),
@@ -502,6 +502,8 @@ const Groups: React.FC = () => {
                 cache_write_token: 'Cache Write / 1M',
                 extra_context_token: 'Extra / 1M',
                 request: '每次请求',
+                audio_second: '音频秒 / 秒',
+                character: '字符 / 1M',
               }[v] ?? v),
             },
             {
@@ -525,11 +527,13 @@ const Groups: React.FC = () => {
           <div style={{ marginTop: 8 }}>
             <Radio.Group
               value={newPriceMode}
-              onChange={(v: 'token' | 'request') => { setNewPriceMode(v); setNewPriceUnit('input_token') }}
+              onChange={(v: 'token' | 'request' | 'audio_second' | 'character') => { setNewPriceMode(v); setNewPriceUnit('input_token') }}
               style={{ marginBottom: 8 }}
             >
               <Radio value="token">按 Token</Radio>
               <Radio value="request">按请求次数</Radio>
+              <Radio value="audio_second">按音频秒</Radio>
+              <Radio value="character">按字符</Radio>
             </Radio.Group>
             <Space wrap>
               <Input

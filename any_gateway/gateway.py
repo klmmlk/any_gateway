@@ -530,7 +530,57 @@ def _extract_asr_summary(upstream_texts: list[str]) -> dict:
     return summary
 
 
-async def _finalize_asr_usage(
+def _extract_ws_usage(upstream_texts: list[str]) -> dict:
+    """从捕获的上游文本帧中尽力提取任务结束帧（task-finished）的 usage 用量。
+
+    透传阶段不解析业务协议；这里仅在会话结束后离线解析，任何解析失败都只是
+    拿不到用量，不影响透传与兜底计费。usage 字段名随模型代际不同
+    （Qwen TTS 3.1 报 tokens、3.0/CosyVoice 报 characters），做多变体兼容：
+    返回 {
+      input_tokens, output_tokens, characters,  # 归一化后的计费用量（拿不到为 0）
+      usage_raw,                                # usage 里全部标量字段原样（审计/联调）
+      finished_frames,                          # 命中的 task-finished 帧原文样本（联调核对字段名）
+    }
+    """
+    def _pick(d: dict, *names) -> int:
+        for n in names:
+            v = d.get(n)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return 0
+
+    usage_raw: dict = {}
+    finished_frames: list[str] = []
+    for text in upstream_texts:
+        try:
+            frame = json.loads(text)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(frame, dict):
+            continue
+        header = frame.get("header") if isinstance(frame.get("header"), dict) else {}
+        if header.get("event") == "task-finished":
+            finished_frames.append(text)
+        payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        if usage:
+            usage_raw.update({
+                k: v for k, v in usage.items() if isinstance(v, (int, float))
+            })
+
+    return {
+        "input_tokens": _pick(usage_raw, "input_tokens", "input_token"),
+        "output_tokens": _pick(usage_raw, "output_tokens", "output_token", "total_tokens"),
+        "characters": _pick(
+            usage_raw,
+            "characters", "input_characters", "output_characters", "chars", "character_count",
+        ),
+        "usage_raw": usage_raw,
+        "finished_frames": finished_frames[:3],
+    }
+
+
+async def _finalize_ws_usage(
     *,
     request_id: str,
     token: dict,
@@ -540,21 +590,24 @@ async def _finalize_asr_usage(
     channel_id: str | None = None,
     status: int = 200,
     upstream_url: str = "",
+    ws_path: str = "/v1/audio/asr/stream",
     meta: dict | None = None,
     counters: dict | None = None,
     upstream_texts: list[str] | None = None,
 ) -> None:
-    """ASR WebSocket 收尾：计费 + UsageLog 落库 + 消息文件落盘（fire-and-forget）。
+    """语音 WebSocket 会话收尾（ASR/TTS 共用）：计费 + UsageLog 落库 + 消息文件落盘。
 
-    与 _finalize_stream_usage 镜像：调 calculate_cost（按 audio_seconds 维度）、
-    update_usage（写入 audio_seconds 字段），最后扣余额。
-    UsageLog 落库成功后，同步写一份与 HTTP 转发同构的消息日志文件
+    与 _finalize_stream_usage 镜像。计费口径由价格管理配置决定（配了哪种按哪种）：
+    request 按次 > audio_second 按秒 > character 按字符 > token 公式；token/字符用量
+    从上游 task-finished 帧离线解析（_extract_ws_usage），解析不到时相应维度为 0、
+    自然落到下一优先级。UsageLog 落库成功后，同步写一份与 HTTP 转发同构的消息日志文件
     （data/sessions/<date>/<request_id>.json.br），否则管理端日志详情会显示
     "（暂无消息记录）"。所有失败仅记录日志，不影响客户端（连接已关闭）。
     """
     group_id = token.get("group_id")
     username = token.get("username")
     multiplier = await _get_group_multiplier(group_id)
+    ws_usage = _extract_ws_usage(upstream_texts or [])
 
     try:
         async with AsyncSession(engine, expire_on_commit=False) as pricing_session:
@@ -562,13 +615,14 @@ async def _finalize_asr_usage(
                 session=pricing_session,
                 group_id=group_id,
                 model=model,
-                input_tokens=0,
-                output_tokens=0,
+                input_tokens=ws_usage["input_tokens"],
+                output_tokens=ws_usage["output_tokens"],
                 multiplier=multiplier,
                 audio_seconds=audio_seconds,
+                characters=ws_usage["characters"],
             )
     except Exception:
-        logger.exception(f"ASR 计费失败 (request_id={request_id})")
+        logger.exception(f"WS 语音会话计费失败 (request_id={request_id})")
         return
 
     usage_saved = False
@@ -577,8 +631,8 @@ async def _finalize_asr_usage(
             token_id=token.get("id"),
             channel_id=channel_id,
             model=model,
-            input_tokens=0,
-            output_tokens=0,
+            input_tokens=ws_usage["input_tokens"],
+            output_tokens=ws_usage["output_tokens"],
             cost_usd=cost_usd,
             duration_ms=wall_duration_seconds * 1000.0,
             status=status,
@@ -587,15 +641,17 @@ async def _finalize_asr_usage(
             request_id=request_id,
             covered_by_package=False,  # WS 端点当前未走套餐检查
             audio_seconds=audio_seconds,
+            characters=ws_usage["characters"],
         )
         usage_saved = True
     except Exception:
-        logger.exception(f"ASR usage 落库失败 (request_id={request_id})")
+        logger.exception(f"WS 语音会话 usage 落库失败 (request_id={request_id})")
 
     if usage_saved:
         # 消息文件与 UsageLog 行配对：只在 DB 行存在时落盘，避免孤儿文件
         summary = {
             **_extract_asr_summary(upstream_texts or []),
+            "usage": ws_usage,
             "audio_duration_seconds": audio_seconds,
             "wall_duration_seconds": wall_duration_seconds,
             "frames": counters or {},
@@ -603,7 +659,7 @@ async def _finalize_asr_usage(
         log_task = asyncio.create_task(log_writer.enqueue_log({
             "timestamp": timestamp(),
             "method": "WS",
-            "path": "/v1/audio/asr/stream",
+            "path": ws_path,
             "request_url": upstream_url,
             "request_headers": {},
             "request_body": json.dumps(
@@ -631,7 +687,7 @@ async def _finalize_asr_usage(
     try:
         await _maybe_deduct(covered=False, username=username, cost_usd=cost_usd)
     except Exception:
-        logger.exception(f"ASR 余额扣减失败 (request_id={request_id})")
+        logger.exception(f"WS 语音会话余额扣减失败 (request_id={request_id})")
 
 
 @dataclasses.dataclass
@@ -1941,29 +1997,32 @@ async def _forward_responses_stream(
 
 
 # =======================
-# WebSocket 端点：实时 ASR 中转
+# WebSocket 端点：实时语音双向透传（ASR / TTS 共用）
 # =======================
-# 上游文本帧捕获预算（字符数）：仅供会话结束后离线提取转写文本落日志，
+# 上游文本帧捕获预算（字符数）：仅供会话结束后离线提取转写文本/用量落日志，
 # 用尽即截断，防止长会话日志无界膨胀。brotli 对这类重复 JSON 压缩率很高。
-_ASR_UPSTREAM_CAPTURE_BUDGET = 64 * 1024
+_WS_UPSTREAM_CAPTURE_BUDGET = 64 * 1024
 
-# 客户端 URL 形式：
-#   wss://gateway.example.com/v1/audio/asr/stream
-#     ?model=qwen-audio-3.0-asr-flash-streaming
+# 客户端 URL 形式（同一 handler 双路径注册，行为完全一致）：
+#   wss://gateway.example.com/v1/audio/asr/stream  —— 存量 ASR 路径，保持兼容
+#   wss://gateway.example.com/v1/audio/tts/stream  —— TTS 语义别名（Qwen-Audio-TTS 等语音合成）
+#     ?model=<模型名>
 #     &api_key=sk-xxx
 #
 # 协议：网关不解析 DashScope 二进制帧，客户端按 dashscope 协议自行组包后发到网关 ws 端点，
-# 网关字节级透传到上游 wss；上游返回的识别结果字节级透传给客户端。
+# 网关字节级透传到上游 wss；上游返回的识别/合成结果字节级透传给客户端。
 # 第一帧约定：若客户端第一个文本消息是 JSON 且包含 audio_duration_seconds 字段，
-# 网关读取作为计费基准；否则按 WS 连接墙钟时长兜底。
+# 网关读取作为计费基准；否则优先用上游 finished 帧 usage 解析的用量，再按 WS 连接墙钟时长兜底。
+# 计费口径完全由价格管理配置决定（request 按次 > audio_second 按秒 > character 按字符 > token）。
 #
 # 错误关闭码：
 #   1008 - 鉴权失败 / 配额超限 / 模型未找到
 #   1011 - 上游连接失败
 #   1013 - 暂时性错误
+@app.websocket("/v1/audio/tts/stream")
 @app.websocket("/v1/audio/asr/stream")
 async def ws_audio_asr_stream(websocket: WebSocket):
-    """实时 ASR WebSocket 端点。"""
+    """实时语音 WebSocket 端点（ASR / TTS 透传）。"""
     # 1. 早 accept，便于发 close code
     await websocket.accept()
 
@@ -2039,7 +2098,7 @@ async def ws_audio_asr_stream(websocket: WebSocket):
             disable_ssl=backend.get("disable_ssl", False),
             subprotocols=subprotocols,
             on_meta=on_meta,
-            capture_upstream_text=_ASR_UPSTREAM_CAPTURE_BUDGET,
+            capture_upstream_text=_WS_UPSTREAM_CAPTURE_BUDGET,
         )
         duration_seconds = float(result.get("duration_seconds") or 0.0)
         session_counters = result.get("counters") or {}
@@ -2057,16 +2116,17 @@ async def ws_audio_asr_stream(websocket: WebSocket):
         except Exception:  # noqa: BLE001
             pass
     finally:
-        # 8. 收尾：按 audio_seconds 计费
+        # 8. 收尾：计费基准=客户端声明 > 上游帧解析用量 > WS 墙钟时长兜底（帧解析在收尾函数内做）
         declared_audio = meta.get("audio_duration_seconds")
         try:
             declared_audio_f = float(declared_audio) if declared_audio is not None else 0.0
         except (TypeError, ValueError):
             declared_audio_f = 0.0
-        # 客户端未声明 audio_duration_seconds 时，按 WS 墙钟时长兜底
+        # 客户端未声明 audio_duration_seconds 时，按 WS 墙钟时长兜底；
+        # 若价格配的是 token/字符/按次，收尾函数会从上游帧解析真实用量来计费
         billable_audio = declared_audio_f if declared_audio_f > 0 else duration_seconds
         if billable_audio > 0:
-            await _finalize_asr_usage(
+            await _finalize_ws_usage(
                 request_id=request_id,
                 token=token,
                 model=model,
@@ -2075,6 +2135,7 @@ async def ws_audio_asr_stream(websocket: WebSocket):
                 channel_id=backend.get("channel_id"),
                 status=status_code,
                 upstream_url=upstream_url,
+                ws_path=websocket.scope.get("path", "/v1/audio/asr/stream"),
                 meta=meta,
                 counters=session_counters,
                 upstream_texts=upstream_texts,
