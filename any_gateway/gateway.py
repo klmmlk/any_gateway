@@ -1350,16 +1350,13 @@ async def _visible_model_entries(request: Request, current_user: Optional[dict])
        - token_group_id 有值 → 只返回该 group 的模型
        - token_username 有值（无 group 绑定）→ 返回该用户所在所有分组的模型
     2. JWT → 原有逻辑（admin/superadmin 看全部，普通用户看所在分组）
-    3. 两者都无 → 401
+    3. 两者都无 → 公开视图：返回全部启用渠道的模型（元信息端点免鉴权）
     """
     from db.models import Channel, GroupChannel
 
     # 从 middleware 注入的 API Key token 信息
     token_group_id: str | None = getattr(request.state, "token_group_id", None)
     token_username: str | None = getattr(request.state, "token_username", None)
-
-    if token_group_id is None and token_username is None and not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required")
 
     def _extract_models(ch: Channel) -> list[dict]:
         provider = ch.provider or "unknown"
@@ -1432,9 +1429,13 @@ async def _visible_model_entries(request: Request, current_user: Optional[dict])
             # 策略 2：token 有 username，按用户所在分组
             channels = await _channels_by_username(session, token_username)
 
+        elif current_user is None:
+            # 策略 3：未带任何凭证——公开视图，返回全部启用渠道（/v1/models 免鉴权）
+            result = await session.execute(select(Channel).where(col(Channel.enabled) == True))
+            channels = result.scalars().all()
+
         else:
-            # 策略 3：JWT 认证
-            # current_user is guaranteed non-None by the 401 guard above (if not api_key_authed and not current_user)
+            # 策略 4：JWT 认证
             username = current_user["username"]
             role = current_user["role"]
             if role in ("admin", "superadmin"):

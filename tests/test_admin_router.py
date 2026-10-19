@@ -1035,10 +1035,11 @@ def test_models_with_invalid_api_key_returns_specific_error(client):
     assert body.get("error") == "invalid api key"
 
 
-def test_models_without_auth_returns_401(client):
-    """GET /v1/models 不带任何认证时应返回 401。"""
+def test_models_without_auth_returns_public_view(client):
+    """GET /v1/models 不带任何认证时免鉴权，返回全部启用渠道的模型（公开视图）。"""
     res = client.get("/v1/models")
-    assert res.status_code == 401
+    assert res.status_code == 200
+    assert isinstance(res.json()["data"], list)
 
 
 def test_models_filtered_by_token_group(client):
@@ -1138,7 +1139,7 @@ def test_models_passthrough_tts_voices(client):
 
 
 def test_model_info_endpoint_returns_single_model(client):
-    """GET /v1/models/{model_id} 返回单模型条目：原名（含斜杠）带 voices、别名继承、未知 404、无认证 401。"""
+    """GET /v1/models/{model_id} 返回单模型条目：原名（含斜杠）带 voices、别名继承、未知 404、无认证走公开视图。"""
     import json as _json
 
     ADMIN_HEADERS = {"x-admin-key": "test-admin-secret"}
@@ -1185,9 +1186,15 @@ def test_model_info_endpoint_returns_single_model(client):
     res = client.get("/v1/models/definitely-not-exist-xyz", headers={"x-api-key": api_key})
     assert res.status_code == 404
 
-    # 无认证 401
+    # 无认证：公开视图，返回全部启用渠道的模型（免鉴权元信息端点）
     res = client.get("/v1/models/unique-alias")
-    assert res.status_code == 401
+    assert res.status_code == 200
+    assert res.json()["voices"] == voices
+
+    # 列表端点同样免鉴权
+    res = client.get("/v1/models")
+    assert res.status_code == 200
+    assert any(m["id"] == "demo-tts/unique-model-info" for m in res.json()["data"])
 
 
 def test_bound_group_token_works_immediately_after_channel_update(client):
