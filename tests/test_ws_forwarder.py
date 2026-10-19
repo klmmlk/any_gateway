@@ -362,3 +362,61 @@ async def test_capture_off_by_default(upstream):
     )
     assert result["upstream_texts"] == []
     assert result["upstream_texts_truncated"] is False
+
+
+# ============================================================
+# run-task 帧 payload.model 改写（model_mapping 别名 → 上游真实模型名）
+# ============================================================
+@pytest.mark.asyncio
+async def test_run_task_model_rewritten(upstream):
+    """run-task 帧的 model 被改写为规范上游名；非 run-task/非 JSON 帧原样透传。"""
+    ws = StubWebSocket()
+    ws.feed_text(json.dumps({
+        "header": {"action": "run-task", "task_id": "t1", "streaming": "out"},
+        "payload": {"task_group": "audio", "task": "tts",
+                    "function": "SpeechSynthesizer", "model": "TTS-Model",
+                    "input": {"text": "hi"}},
+    }))
+    ws.feed_text(json.dumps({
+        "header": {"action": "finish-task", "task_id": "t1", "streaming": "out"},
+        "payload": {"model": "TTS-Model", "input": {}},
+    }))
+    ws.feed_text("plain-text-not-json")
+    ws.trigger_disconnect()
+
+    await forward_ws_session(
+        client_ws=ws,
+        upstream_url=upstream.url,
+        api_key="test-key",
+        rewrite_run_task_model="qwen-audio-3.0-tts-flash",
+    )
+
+    assert len(upstream.received) == 3
+    f0 = json.loads(upstream.received[0])
+    assert f0["header"]["action"] == "run-task"
+    assert f0["payload"]["model"] == "qwen-audio-3.0-tts-flash"
+    # finish-task 帧：即使带 model 键也不改（只认 run-task）
+    f1 = json.loads(upstream.received[1])
+    assert f1["header"]["action"] == "finish-task"
+    assert f1["payload"]["model"] == "TTS-Model"
+    assert upstream.received[2] == "plain-text-not-json"
+
+
+@pytest.mark.asyncio
+async def test_run_task_model_untouched_when_rewrite_disabled(upstream):
+    """不传 rewrite_run_task_model 时完全透传（存量 ASR 行为不变）。"""
+    ws = StubWebSocket()
+    ws.feed_text(json.dumps({
+        "header": {"action": "run-task", "task_id": "t1", "streaming": "out"},
+        "payload": {"model": "qwen-audio-3.0-asr-flash-streaming", "input": {}},
+    }))
+    ws.trigger_disconnect()
+
+    await forward_ws_session(
+        client_ws=ws,
+        upstream_url=upstream.url,
+        api_key="test-key",
+    )
+
+    f0 = json.loads(upstream.received[0])
+    assert f0["payload"]["model"] == "qwen-audio-3.0-asr-flash-streaming"

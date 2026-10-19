@@ -2058,6 +2058,10 @@ async def ws_audio_asr_stream(websocket: WebSocket):
         await websocket.close(code=1008, reason="no wss backend")
         return
 
+    # 计费/落库用规范上游模型名（与 HTTP 主代理改写 body.model 后的语义一致）：
+    # 客户端可用别名请求，但价格与用量记录都挂在真实模型上
+    billing_model = backend.get("model") or model
+
     # 5. 拼 wss URL：base_url https:// → wss://，拼上 ws_path
     base = (backend["base_url"] or "").rstrip("/")
     if base.startswith("https://"):
@@ -2099,6 +2103,7 @@ async def ws_audio_asr_stream(websocket: WebSocket):
             subprotocols=subprotocols,
             on_meta=on_meta,
             capture_upstream_text=_WS_UPSTREAM_CAPTURE_BUDGET,
+            rewrite_run_task_model=billing_model,
         )
         duration_seconds = float(result.get("duration_seconds") or 0.0)
         session_counters = result.get("counters") or {}
@@ -2129,7 +2134,7 @@ async def ws_audio_asr_stream(websocket: WebSocket):
             await _finalize_ws_usage(
                 request_id=request_id,
                 token=token,
-                model=model,
+                model=billing_model,
                 audio_seconds=billable_audio,
                 wall_duration_seconds=duration_seconds,
                 channel_id=backend.get("channel_id"),

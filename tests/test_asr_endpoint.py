@@ -203,6 +203,7 @@ async def _seed_channel_and_token(
     quota_usd: float = 100.0,
     used_usd: float = 0.0,
     models: list[str] | None = None,
+    model_mapping: str | None = None,
 ) -> tuple[str, str]:
     from db.models import Channel, GroupChannel, Token, User, UserGroup
 
@@ -227,7 +228,7 @@ async def _seed_channel_and_token(
             weight=1,
             enabled=True,
             models=json.dumps(models or ["qwen-audio-3.0-asr-flash-streaming"]),
-            model_mapping=None,
+            model_mapping=model_mapping,
             protocol=protocol,
             ws_path="/api-ws/v1/inference",
             ws_subprotocols=None,
@@ -645,5 +646,52 @@ async def test_tts_bills_per_character_from_upstream_usage(server_url):
         assert log.characters == 42
         # 42 / 1M * 30 = 0.00126
         assert abs(log.cost_usd - 0.00126) < 1e-9
+    finally:
+        upstream.stop()
+
+
+@pytest.mark.asyncio
+async def test_tts_alias_mapping_rewrites_run_task_and_bills(server_url):
+    """别名映射：run-task 帧的 model 被改写为上游真实名，计费/用量挂在规范名上。"""
+    # 独立模型名：共享测试库中其他用例给 qwen-audio-3.0-tts-flash 配过 request 价，
+    # request 优先级高于 character 会干扰本用例的按字符断言
+    model = "qwen-tts-alias-target"
+    alias = "tts-alias-e2e"
+    ch_id, api_key = await _seed_channel_and_token(
+        api_key="sk-ttsmap000001",
+        models=[model],
+        model_mapping=json.dumps({alias: model}),
+    )
+    await _seed_model_price(model, "character", 30.0)  # 30 USD / 1M 字符
+    upstream = UpstreamWithFinishedFrame(_finished_usage_frame({"input_characters": 20}))
+    upstream.start_in_thread()
+    await _patch_channel_base_url(ch_id, upstream.url)
+
+    try:
+        async with websockets.connect(
+            f"{server_url['ws']}/v1/audio/tts/stream?model={alias}&api_key={api_key}"
+        ) as ws:
+            await ws.send(json.dumps({
+                "header": {"action": "run-task", "task_id": "t1", "streaming": "out"},
+                "payload": {"model": alias, "input": {"text": "别名测试"}},
+            }))
+            await ws.send(json.dumps({
+                "header": {"action": "finish-task", "task_id": "t1", "streaming": "out"},
+                "payload": {"input": {}},
+            }))
+            # 上游 echo：改写后的 run-task + finished 帧 + finish-task echo
+            got = [await asyncio.wait_for(ws.recv(), timeout=5.0) for _ in range(3)]
+
+        f0 = json.loads(got[0])
+        assert f0["header"]["action"] == "run-task"
+        assert f0["payload"]["model"] == model  # 别名已改写为上游真实名
+
+        await asyncio.sleep(0.5)
+        log = await _latest_usage_log()
+        assert log is not None
+        assert log.model == model  # 用量/计费挂在规范名上（别名查不到价也能计到）
+        assert log.characters == 20
+        # 20 / 1M * 30 = 0.0006
+        assert abs(log.cost_usd - 0.0006) < 1e-9
     finally:
         upstream.stop()

@@ -37,17 +37,42 @@ OnMetaHook = Optional[Callable[[dict], Awaitable[None]]]
 _META_KEY = "audio_duration_seconds"
 
 
+def _rewrite_run_task_model(text: str, canonical_model: str) -> str:
+    """把 DashScope run-task 帧里的 payload.model 改写为规范上游模型名。
+
+    model_mapping 是网关级概念：客户端用别名请求，但上游只认真实模型名——
+    与 HTTP 代理改写 body.model 的语义一致。非 JSON / 非 run-task / 结构不符
+    一律原样返回，保持字节级透传语义。
+    """
+    try:
+        frame = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if not isinstance(frame, dict):
+        return text
+    header = frame.get("header")
+    payload = frame.get("payload")
+    if not isinstance(header, dict) or header.get("action") != "run-task":
+        return text
+    if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
+        return text
+    payload["model"] = canonical_model
+    return json.dumps(frame, ensure_ascii=False)
+
+
 async def _client_to_upstream(
     client_ws: WebSocket,
     upstream: websockets.WebSocketClientProtocol,
     on_meta: OnMetaHook,
     meta_seen: dict,
     counters: dict,
+    rewrite_run_task_model: Optional[str] = None,
 ) -> None:
     """客户端 → 上游：逐条 receive，按类型原样 send。
 
     首条文本消息若是 JSON 且含 META_KEY，视为网关计费声明：消费（不转发）并调
-    on_meta(meta) 一次。其余消息透传，不修改内容。
+    on_meta(meta) 一次。其余消息透传；rewrite_run_task_model 非空时对 run-task
+    帧做 payload.model 改写（别名 → 上游真实模型名）。
     """
     while True:
         msg = await client_ws.receive()
@@ -73,6 +98,8 @@ async def _client_to_upstream(
                         logger.exception("on_meta 钩子异常")
                     counters["client_text"] += 1
                     continue  # 消费掉，不转发上游
+            if rewrite_run_task_model:
+                text = _rewrite_run_task_model(text, rewrite_run_task_model)
             await upstream.send(text)
             counters["client_text"] += 1
         elif "bytes" in msg and msg["bytes"] is not None:
@@ -121,11 +148,14 @@ async def forward_ws_session(
     on_meta: OnMetaHook = None,
     open_timeout: float = 30.0,
     capture_upstream_text: int = 0,
+    rewrite_run_task_model: Optional[str] = None,
 ) -> dict:
     """建立上游 wss 连接，并在客户端与上游之间做双向 pump。
 
     capture_upstream_text > 0 时，捕获上游文本帧原文（总字符数不超过该值），
     用于会话结束后落日志/离线解析；0 表示不捕获。
+    rewrite_run_task_model 非空时，客户端 run-task 帧的 payload.model 被改写为该值
+    （model_mapping 别名 → 上游真实模型名，与 HTTP 代理的 body.model 改写对齐）。
 
     Returns: dict，包含
         - duration_seconds: float，WS 会话墙钟时长
@@ -185,7 +215,10 @@ async def forward_ws_session(
     try:
         # gather 任一端异常即取消另一端，关闭两侧
         client_task = asyncio.create_task(
-            _client_to_upstream(client_ws, upstream, on_meta, meta_seen, counters)
+            _client_to_upstream(
+                client_ws, upstream, on_meta, meta_seen, counters,
+                rewrite_run_task_model=rewrite_run_task_model,
+            )
         )
         upstream_task = asyncio.create_task(
             _upstream_to_client(upstream, client_ws, counters, capture)
