@@ -38,13 +38,14 @@ const PROVIDER_COLORS: Record<string, string> = {
   anthropic: 'purple',
   gemini: 'green',
   'dashscope-asr': 'orange',
+  dashscope: 'orange',
 }
 
 const PROVIDER_OPTIONS = [
   { label: 'OpenAI', value: 'openai' },
   { label: 'Anthropic', value: 'anthropic' },
   { label: 'Gemini', value: 'gemini' },
-  { label: 'DashScope ASR (wss)', value: 'dashscope-asr' },
+  { label: 'DashScope (wss)', value: 'dashscope' },
 ]
 
 interface Mapping {

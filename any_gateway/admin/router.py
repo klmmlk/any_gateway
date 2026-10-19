@@ -1129,7 +1129,8 @@ async def _fetch_upstream_models(channel: dict) -> list:
     # DashScope 实时 ASR 等 wss 渠道没有标准的 /v1/models 端点，
     # 直接从本地白名单返回（前端按 OpenAI /models 响应格式渲染）。
     provider = (channel.get("provider") or "").lower()
-    if provider == "dashscope-asr":
+    # provider 兼容历史值 dashscope-asr（存量库），新值统一为 dashscope
+    if provider in ("dashscope-asr", "dashscope"):
         from services.asr_catalog import DASHSCOPE_ASR_MODELS
         return DASHSCOPE_ASR_MODELS
 
